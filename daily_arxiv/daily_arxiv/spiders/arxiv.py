@@ -49,33 +49,37 @@ class ArxivAPISpider:
         self.logger.info(f"目标类别对: {self.target_category_pairs}, 目标日期: {self.target_date}")
 
     def construct_query(self):
-        """构造 API 查询字符串"""
+        """构造 API 查询字符串，包含日期筛选条件"""
         queries = []
         for target_cat, cross_cat in self.target_category_pairs:
             # 在pymed中，arXiv类别需要用abs:前缀
             query = f"abs:{target_cat} AND abs:{cross_cat}"
             queries.append(query)
         combined_query = " OR ".join([f"({q})" for q in queries])
-        # 限制来源为arXiv
-        combined_query += " AND source:arXiv"
+        
+        # 添加来源和日期筛选（pymed支持的日期格式）
+        # 将 YYYY-MM-DD 转换为 YYYY/MM/DD 格式
+        formatted_date = self.target_date.replace("-", "/")
+        combined_query += f" AND source:arXiv AND (date >= '{formatted_date}') AND (date < '{self._get_next_day(formatted_date)}')"
+        
         return combined_query
 
+    def _get_next_day(self, date_str):
+        """计算次日日期，用于日期范围筛选"""
+        date_obj = datetime.strptime(date_str, "%Y/%m/%d")
+        next_day = date_obj + timedelta(days=1)
+        return next_day.strftime("%Y/%m/%d")
+
     def search_articles(self, max_results=1000):
-        """搜索文章"""
+        """搜索文章（移除mindate和maxdate参数，改用查询字符串筛选）"""
         query = self.construct_query()
         self.logger.info(f"执行查询: {query}")
 
         try:
-            # 计算日期范围（目标日期的00:00到23:59）
-            target_date_obj = datetime.strptime(self.target_date, "%Y-%m-%d")
-            next_day = target_date_obj + timedelta(days=1)
-            
-            # 执行搜索
+            # 执行搜索（不再传递mindate和maxdate参数）
             results = self.pubmed.query(
                 query,
-                max_results=max_results,
-                mindate=target_date_obj.strftime("%Y/%m/%d"),
-                maxdate=next_day.strftime("%Y/%m/%d")
+                max_results=max_results
             )
             return list(results)
         except Exception as e:
@@ -101,8 +105,11 @@ class ArxivAPISpider:
             # 检查是否匹配目标类别对
             for target_cat, cross_cat in self.target_category_pairs:
                 if target_cat in categories and cross_cat in categories:
-                    # 提取论文ID（从PMID或标题中提取）
-                    paper_id = result.pmid if result.pmid else result.title[:10].replace(' ', '')
+                    # 修复：从标题提取arXiv ID（arXiv标题通常包含ID如[arXiv:2301.01234]）
+                    paper_id = self._extract_arxiv_id(result.title)
+                    # 如果标题中没有ID，则使用PMID作为备选
+                    if not paper_id:
+                        paper_id = result.pmid if result.pmid else f"unknown_{hash(result.title)}"
                     
                     filtered_results.append({
                         "id": paper_id,
@@ -116,6 +123,14 @@ class ArxivAPISpider:
                     })
                     break
         return filtered_results
+
+    def _extract_arxiv_id(self, title):
+        """从标题中提取arXiv论文ID（格式通常为arXiv:xxxx.xxxx）"""
+        import re
+        match = re.search(r'arXiv:(\d+\.\d+)', title)
+        if match:
+            return match.group(1)
+        return None
 
     def run(self, output_file=None):
         """运行爬虫并可选地将结果保存到文件"""
@@ -163,4 +178,3 @@ if __name__ == "__main__":
         print(f"- {result['id']}: {result['title']}")
         print(f" 类别: {result['categories']}")
         print(f" 日期: {result['published']}\n")
-    
