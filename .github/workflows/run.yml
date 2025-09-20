@@ -1,56 +1,69 @@
 name: arXiv-daily-ai-enhanced
 on:
   schedule:
-    - cron: "03 19 * * *"  # UTC时间，可根据需要调整
-  workflow_dispatch:  # 手动触发开关
+    - cron: "03 19 * * *"
+  workflow_dispatch:
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies (uv + virtual env + pymed)
+      # --------------------------
+      # 步骤1：安装两个独立环境
+      # 1. crawl-env：仅用于arXiv爬取（依赖pymed+arxiv，无scrapy）
+      # 2. main-env：用于其他步骤（依赖scrapy、langchain等，无pymed）
+      # --------------------------
+      - name: Install two isolated environments
         run: |
-          # 1. 安装 uv 包管理器
+          # 安装uv包管理器
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          # 2. 创建并激活虚拟环境（UV会自动处理环境变量，无需手动source）
-          uv venv .venv
-          # 3. 优先安装 pymed（避免后续依赖冲突）
-          uv pip install pymed==0.8.9
-          # 4. 安装 arxiv 包（确保版本兼容，避免旧版本问题）
-          uv pip install arxiv==2.1.3
-          # 5. 同步其他依赖（如 requirements.txt/pyproject.toml，若有则安装）
-          if [ -f "requirements.txt" ]; then
-            uv pip install -r requirements.txt
-          elif [ -f "pyproject.toml" ]; then
-            uv sync
-          else
-            echo "⚠️ 未找到依赖文件（requirements.txt/pyproject.toml），仅安装核心包"
-          fi
-          # 6. 输出已安装包列表，便于调试
-          uv pip list > installed_packages.txt
-          echo "✅ 已安装的 Python 包："
-          cat installed_packages.txt
 
-      - name: Crawl arXiv papers
+          # 1. 创建爬取专用环境（crawl-env），仅安装pymed和arxiv
+          echo "=== 创建爬取专用环境（crawl-env） ==="
+          uv venv crawl-env
+          uv run -p crawl-env pip install pymed==0.8.9 arxiv==2.1.3 requests==2.32.5
+          uv run -p crawl-env pip list > crawl_env_packages.txt
+          echo "✅ 爬取环境已安装包："
+          cat crawl_env_packages.txt
+
+          # 2. 创建主环境（main-env），安装scrapy、langchain等其他依赖
+          echo -e "\n=== 创建主环境（main-env） ==="
+          uv venv main-env
+          # 安装scrapy及相关依赖
+          uv run -p main-env pip install scrapy==2.12.0 langchain==0.3.20 langchain-openai==0.3.9 openai==1.66.3
+          # 同步其他依赖（如有requirements.txt）
+          if [ -f "requirements.txt" ]; then
+            uv run -p main-env pip install -r requirements.txt
+          fi
+          uv run -p main-env pip list > main_env_packages.txt
+          echo "✅ 主环境已安装包："
+          cat main_env_packages.txt
+
+      # --------------------------
+      # 步骤2：arXiv爬取（使用crawl-env，避免依赖冲突）
+      # --------------------------
+      - name: Crawl arXiv papers (isolated env)
         id: crawl_step
         run: |
-          # 关键：使用 uv run 自动激活虚拟环境（无需手动 source）
-          uv run -p .venv python -c "import pymed; print('✅ pymed 导入成功')"  # 预检查
-          
+          # 预检查pymed是否能导入（爬取环境）
+          echo "=== 预检查爬取环境pymed导入 ==="
+          if uv run -p crawl-env python -c "import pymed; print('✅ pymed导入成功')"; then
+            echo "pymed预检查通过"
+          else
+            echo "❌ pymed预检查失败，终止爬取"
+            exit 1
+          fi
+
+          # 准备日期和目录
           today=$(date -u "+%Y-%m-%d")
+          mkdir -p data
           echo "开始爬取 $today 的arXiv论文... / Starting to crawl $today arXiv papers..."
 
-          # 确保 data 目录存在（避免创建文件时目录不存在报错）
-          mkdir -p data
-          
-          # 检查今日文件是否已存在，如存在则删除
+          # 删除旧文件（如有）
           if [ -f "data/${today}.jsonl" ]; then
-              echo "🗑️ 发现今日文件已存在，正在删除重新生成... / Found existing today's file, deleting for fresh start..."
+              echo "🗑️ 删除现有文件：data/${today}.jsonl"
               rm "data/${today}.jsonl"
-              echo "✅ 已删除现有文件：data/${today}.jsonl / Deleted existing file: data/${today}.jsonl"
-          else
-              echo "📝 今日文件不存在，准备新建... / Today's file doesn't exist, ready to create new one..."
           fi
 
           # 切换目录并设置环境变量
@@ -62,34 +75,37 @@ jobs:
           export MODEL_NAME="${{ vars.MODEL_NAME }}"
           export OUTPUT_FILE="../data/${today}.jsonl"
 
-          # 使用 uv run 运行脚本（自动激活虚拟环境）
-          uv run -p ../.venv python daily_arxiv/spiders/arxiv.py
+          # 关键：使用爬取专用环境（crawl-env）运行爬取脚本
+          echo "=== 开始运行爬取脚本 ==="
+          uv run -p ../crawl-env python daily_arxiv/spiders/arxiv.py
 
-          # 检查是否生成了数据文件
+          # 检查爬取结果
           if [ ! -f "../data/${today}.jsonl" ]; then
-              echo "❌ 爬取失败，未生成数据文件 / Crawling failed, no data file generated"
+              echo "❌ 爬取失败：未生成数据文件"
               exit 1
           fi
 
           echo "crawl_date=$today" >> $GITHUB_OUTPUT
-          echo "✅ 爬取完成 / Crawling completed"
+          echo "✅ 爬取完成，数据文件：data/${today}.jsonl"
 
-      - name: Check for duplicates
+      # --------------------------
+      # 步骤3：去重检查（使用main-env，依赖scrapy等）
+      # --------------------------
+      - name: Check for duplicates (main env)
         id: dedup_check
         run: |
-          # 使用 uv run 激活虚拟环境
-          echo "执行去重检查... / Performing intelligent deduplication check..."
-
+          echo "=== 开始去重检查（使用主环境） ==="
           cd daily_arxiv
-          set +e  # 允许脚本返回非0退出码
-          uv run -p ../.venv python daily_arxiv/check_stats.py
+          set +e
+          # 使用主环境运行去重脚本（依赖scrapy等）
+          uv run -p ../main-env python daily_arxiv/check_stats.py
           dedup_exit_code=$?
-          set -e  # 恢复严格模式
+          set -e
 
-          echo "去重检查退出码: $dedup_exit_code / Dedup check exit code: $dedup_exit_code"
+          echo "去重检查退出码: $dedup_exit_code"
           echo "dedup_exit_code=$dedup_exit_code" >> $GITHUB_OUTPUT
 
-          # 根据退出码判断是否有新内容
+          # 判断是否有新内容
           case $dedup_exit_code in
               0)
                   echo "has_new_content=true" >> $GITHUB_OUTPUT
@@ -104,19 +120,21 @@ jobs:
                   exit 1
                   ;;
               *)
-                  echo "❌ 未知退出码，停止工作流 / Unknown exit code, stop workflow"
+                  echo "❌ 未知退出码，终止工作流"
                   echo "has_new_content=false" >> $GITHUB_OUTPUT
                   echo "skip_reason=unknown_error" >> $GITHUB_OUTPUT
                   exit 1
                   ;;
           esac
 
-      - name: AI Enhancement Processing
+      # --------------------------
+      # 步骤4：AI增强（使用main-env，依赖langchain等）
+      # --------------------------
+      - name: AI Enhancement Processing (main env)
         if: steps.dedup_check.outputs.has_new_content == 'true'
         run: |
-          # 使用 uv run 激活虚拟环境
           today=${{ steps.crawl_step.outputs.crawl_date }}
-          echo "开始AI增强处理... / Starting AI enhancement processing..."
+          echo "=== 开始AI增强处理（使用主环境） ==="
 
           cd ai
           export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
@@ -124,105 +142,92 @@ jobs:
           export LANGUAGE="${{ vars.LANGUAGE }}"
           export MODEL_NAME="${{ vars.MODEL_NAME }}"
 
-          uv run -p ../.venv python enhance.py --data ../data/${today}.jsonl
+          # 使用主环境运行AI增强脚本
+          uv run -p ../main-env python enhance.py --data ../data/${today}.jsonl
 
           if [ $? -ne 0 ]; then
-              echo "❌ AI处理失败 / AI processing failed"
+              echo "❌ AI处理失败"
               exit 1
           fi
-          echo "✅ AI增强处理完成 / AI enhancement processing completed"
+          echo "✅ AI增强处理完成"
 
-      - name: Convert to Markdown
+      # --------------------------
+      # 步骤5：Markdown转换（使用main-env）
+      # --------------------------
+      - name: Convert to Markdown (main env)
         if: steps.dedup_check.outputs.has_new_content == 'true'
         run: |
-          # 使用 uv run 激活虚拟环境
           today=${{ steps.crawl_step.outputs.crawl_date }}
-          echo "转换为Markdown格式... / Converting to Markdown format..."
+          echo "=== 开始Markdown转换（使用主环境） ==="
 
           export LANGUAGE="${{ vars.LANGUAGE }}"
           cd to_md
           AI_FILE="../data/${today}_AI_enhanced_${LANGUAGE}.jsonl"
 
-          # 检查AI增强文件是否存在
           if [ ! -f "$AI_FILE" ]; then
-              echo "❌ 错误：未找到AI增强文件 / Error: AI enhanced file not found"
-              echo "AI文件路径: $AI_FILE"
+              echo "❌ 未找到AI增强文件：$AI_FILE"
               exit 1
           fi
 
-          uv run -p ../.venv python convert.py --data "$AI_FILE"
+          # 使用主环境运行转换脚本
+          uv run -p ../main-env python convert.py --data "$AI_FILE"
 
           if [ $? -ne 0 ]; then
-              echo "❌ Markdown转换失败 / Markdown conversion failed"
+              echo "❌ Markdown转换失败"
               exit 1
           fi
-          echo "✅ Markdown转换完成 / Markdown conversion completed"
+          echo "✅ Markdown转换完成"
 
+      # --------------------------
+      # 后续步骤（文件更新、提交等，无需特殊环境）
+      # --------------------------
       - name: Update file list
         if: steps.dedup_check.outputs.has_new_content == 'true'
         run: |
-          echo "更新文件列表... / Updating file list..."
-          mkdir -p assets  # 确保assets目录存在
+          echo "=== 更新文件列表 ==="
+          mkdir -p assets
           ls data/*.jsonl | sed 's|data/||' > assets/file-list.txt
-          echo "✅ 文件列表更新完成 / File list updated"
+          echo "✅ 文件列表更新完成"
 
       - name: Summary
         run: |
-          # 输出工作流总结
           if [ "${{ steps.dedup_check.outputs.has_new_content }}" = "true" ]; then
-            echo "✅ 工作流完成：去重发现新内容并成功处理 / Workflow completed: Smart deduplication found new content and processed successfully"
+            echo "✅ 工作流完成：新内容已处理"
           else
-            case "${{ steps.dedup_check.outputs.skip_reason }}" in
-              "no_new_content")
-                echo "ℹ️ 工作流完成：去重后无新内容 / Workflow completed: No new content after smart deduplication"
-                ;;
-              "processing_error")
-                echo "⚠️ 工作流完成：去重处理出错 / Workflow completed: Deduplication processing error"
-                ;;
-              "unknown_error")
-                echo "⚠️ 工作流完成：未知错误 / Workflow completed: Unknown error"
-                ;;
-              *)
-                echo "ℹ️ 工作流完成：未知原因跳过处理 / Workflow completed: Skipped for unknown reason"
-                ;;
-            esac
+            echo "ℹ️ 工作流完成：无新内容（原因：${{ steps.dedup_check.outputs.skip_reason }}）"
           fi
 
       - name: Commit changes
         if: steps.dedup_check.outputs.has_new_content == 'true'
         run: |
-          # 配置Git身份并提交变更
           git config --global user.email "${{ vars.EMAIL }}"
           git config --global user.name "${{ vars.NAME }}"
           git add .
 
-          # 检查是否有变更需要提交
           if git diff --staged --quiet; then
-            echo "ℹ️ 没有变更需要提交 / No changes to commit"
+            echo "ℹ️ 无变更需提交"
             exit 0
           fi
 
           git commit -m "update: $(date -u '+%Y-%m-%d') arXiv papers"
-          echo "✅ 变更已提交 / Changes committed"
+          echo "✅ 变更已提交"
 
       - name: Pull latest changes and push
         if: steps.dedup_check.outputs.has_new_content == 'true'
         run: |
-          # 配置Git拉取策略，避免冲突
           git config pull.rebase true
           git config rebase.autoStash true
 
-          # 重试机制：3次推送尝试
           for i in {1..3}; do
-            echo "推送尝试 $i / Push attempt $i"
+            echo "推送尝试 $i"
             if git push origin main; then
-              echo "✅ 推送成功 / Push successful"
+              echo "✅ 推送成功"
               break
             else
-              echo "⚠️ 推送失败，拉取最新变更... / Push failed, pulling latest changes..."
-              git pull origin main --no-edit || true  # 拉取最新代码
+              echo "⚠️ 推送失败，拉取最新代码..."
+              git pull origin main --no-edit || true
               if [ $i -eq 3 ]; then
-                echo "❌ 3次尝试后推送失败 / Failed to push after 3 attempts"
+                echo "❌ 3次尝试后推送失败"
                 exit 1
               fi
             fi
