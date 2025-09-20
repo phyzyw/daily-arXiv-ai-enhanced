@@ -39,7 +39,7 @@ jobs:
           else
             echo "📝 前一天文件不存在，准备新建... / Previous day's file doesn't exist, ready to create new one..."
           fi
-          cd daily_arxiv/daily_arxiv
+          cd daily_arxiv/daily_arxiv/spiders/
           export HUGGINGFACE_API_KEY=${{ secrets.HUGGINGFACE_API_KEY }}
           export LANGUAGE="${{ vars.LANGUAGE }}"
           export CATEGORIES="${{ vars.CATEGORIES }}"
