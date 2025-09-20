@@ -1,4 +1,4 @@
-import arxiv_client as arxiv
+import arxiv
 import os
 import logging
 import json
