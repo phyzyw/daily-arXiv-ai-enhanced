@@ -1,93 +1,158 @@
-import scrapy
+import arxiv
 import os
-import re
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
 
-class ArxivSpider(scrapy.Spider):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Get user-specified categories from CATEGORIES environment variable
-        categories = os.environ.get("CATEGORIES")
-        categories = [cat.strip() for cat in categories.split(",")]
+class ArxivAPISpider:
+    def __init__(self, categories=None, date=None):
+        """
+        初始化Arxiv API爬虫
         
-        # Generate cross-disciplinary combinations with cs.LG and cs.AI
+        Args:
+            categories: 用户指定的类别列表，如 ['cs.CV', 'cs.CL']
+            date: 目标日期，格式为 'YYYY-MM-DD'
+        """
+        # 设置类别
+        if categories is None:
+            categories = os.environ.get("CATEGORIES", "")
+            self.categories = [cat.strip() for cat in categories.split(",")] if categories else []
+        else:
+            self.categories = categories
+            
+        if not self.categories:
+            raise ValueError("至少需要指定一个类别")
+        
+        # 设置目标日期
+        if date is None:
+            self.target_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            self.target_date = date
+            
+        # 生成交叉学科组合
         cross_categories = ["cs.LG", "cs.AI"]
-        self.target_category_pairs = [(cat, cross_cat) for cat in categories for cross_cat in cross_categories]
-        
-        # Create start URLs for all user-specified categories
-        self.start_urls = [
-            f"https://arxiv.org/list/{cat}/new" for cat in categories
+        self.target_category_pairs = [
+            (cat, cross_cat) for cat in self.categories for cross_cat in cross_categories
         ]
         
-        # Get target date from environment or default to today
-        self.target_date = kwargs.get('date', datetime.now().strftime("%Y-%m-%d"))
-        self.logger.info(f"Target category pairs: {self.target_category_pairs}, Target date: {self.target_date}")
-
-    name = "arxiv"
-    allowed_domains = ["arxiv.org"]
-
-    def parse(self, response):
-        # Extract the current category from the URL
-        current_category = response.url.split("/list/")[-1].split("/")[0]
+        # 设置API客户端
+        self.client = arxiv.Client(
+            page_size=100,
+            delay_seconds=3.0,  # 遵守arXiv的API使用礼仪
+            num_retries=3
+        )
         
-        for paper in response.css("dl dt"):
-            # Extract paper ID
-            paper_anchor = paper.css("a[name^='item']::attr(name)").get()
-            if not paper_anchor:
-                continue
-            paper_id = paper_anchor.replace("item", "")
+        logging.info(f"目标类别对: {self.target_category_pairs}, 目标日期: {self.target_date}")
+
+    def construct_query(self):
+        """构造API查询字符串"""
+        queries = []
+        
+        # 为每个类别对创建查询
+        for target_cat, cross_cat in self.target_category_pairs:
+            # 查找同时属于两个类别的文章
+            query = f"cat:{target_cat} AND cat:{cross_cat}"
+            queries.append(query)
+        
+        # 添加日期筛选 - 注意：arXiv API不支持直接按日期筛选，我们稍后处理
+        # 将多个查询组合成一个
+        combined_query = " OR ".join([f"({q})" for q in queries])
+        
+        # 添加日期范围筛选（通过提交日期）
+        # 注意：arXiv API不直接支持按日期筛选，所以我们先获取更多结果后再过滤
+        return combined_query
+
+    def search_articles(self, max_results=500):
+        """搜索文章"""
+        query = self.construct_query()
+        logging.info(f"执行查询: {query}")
+        
+        search = arxiv.Search(
+            query=query,
+            max_results=max_results,
+            sort_by=arxiv.SortCriterion.SubmittedDate,
+            sort_order=arxiv.SortOrder.Descending
+        )
+        
+        results = self.client.results(search)
+        return results
+
+    def filter_by_date(self, results):
+        """按日期筛选结果"""
+        filtered_results = []
+        
+        for result in results:
+            # 将arXiv的日期转换为字符串格式
+            published_date = result.published.strftime("%Y-%m-%d")
             
-            # Extract submission date
-            submit_date = paper.css(".dateline::text").get()
-            if submit_date:
-                date_parts = submit_date.strip().split()[-3:]  # e.g., "19 Sep 2025"
-                try:
-                    parsed_date = datetime.strptime(' '.join(date_parts), '%d %b %Y').strftime("%Y-%m-%d")
-                    if parsed_date != self.target_date:
-                        self.logger.debug(f"Skipped paper {paper_id} due to date mismatch: {parsed_date} != {self.target_date}")
-                        continue
-                except ValueError:
-                    self.logger.warning(f"Could not parse date for paper {paper_id}: {submit_date}")
-                    continue
+            if published_date == self.target_date:
+                # 提取所有类别
+                categories = [cat.term for cat in result.categories]
+                
+                # 检查是否匹配任何目标类别对
+                for target_cat, cross_cat in self.target_category_pairs:
+                    if target_cat in categories and cross_cat in categories:
+                        filtered_results.append({
+                            "id": result.entry_id.split('/')[-1],  # 提取arXiv ID
+                            "title": result.title,
+                            "authors": [author.name for author in result.authors],
+                            "summary": result.summary,
+                            "published": published_date,
+                            "categories": categories,
+                            "pdf_url": result.pdf_url,
+                            "primary_category": result.primary_category if hasattr(result, 'primary_category') else categories[0] if categories else ""
+                        })
+                        break
+        
+        return filtered_results
+
+    def run(self):
+        """运行爬虫"""
+        logging.info("开始使用arXiv API搜索文章...")
+        
+        try:
+            # 搜索文章
+            results = self.search_articles(max_results=1000)
             
-            # Extract abstract link and arXiv ID
-            abstract_link = paper.css("a[title='Abstract']::attr(href)").get()
-            if not abstract_link:
-                continue
-            arxiv_id = abstract_link.split("/")[-1]
+            # 按日期筛选
+            filtered_results = self.filter_by_date(results)
             
-            # Get the corresponding dd element
-            paper_dd = paper.xpath("following-sibling::dd[1]")
-            if not paper_dd:
-                continue
+            logging.info(f"找到 {len(filtered_results)} 篇匹配的文章")
             
-            # Extract all categories from .list-subjects span
-            subjects_text = paper_dd.css(".list-subjects span::text").getall()
-            paper_categories = set()
-            if subjects_text:
-                for text in subjects_text:
-                    # Extract categories from text like "(cs.CV) (cs.LG) (cs.AI)"
-                    categories = re.findall(r'\(([^)]+)\)', text)
-                    paper_categories.update(categories)
-            else:
-                self.logger.warning(f"Could not extract categories for paper {arxiv_id}, skipping")
-                continue
+            # 输出结果
+            for result in filtered_results:
+                logging.info(f"找到文章: {result['id']}, 标题: {result['title']}, 类别: {result['categories']}")
+                
+            return filtered_results
             
-            # Check if the paper belongs to at least one target category pair
-            matched = False
-            for target_cat, cross_cat in self.target_category_pairs:
-                if target_cat in paper_categories and cross_cat in paper_categories:
-                    yield {
-                        "id": arxiv_id,
-                        "categories": list(paper_categories),
-                        "title": paper_dd.css(".list-title::text").get("").replace("Title:", "").strip(),
-                        "authors": paper_dd.css(".list-authors a::text").getall(),
-                        "submission_date": parsed_date,
-                        "primary_category": current_category
-                    }
-                    self.logger.info(f"Found paper {arxiv_id} with categories {paper_categories} matching pair ({target_cat}, {cross_cat})")
-                    matched = True
-                    break
-            
-            if not matched:
-                self.logger.debug(f"Skipped paper {arxiv_id} with categories {paper_categories} (no matching category pair)")
+        except Exception as e:
+            logging.error(f"搜索过程中发生错误: {str(e)}")
+            return []
+
+# 使用示例
+if __name__ == "__main__":
+    # 设置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # 从环境变量获取类别，或使用默认值
+    categories = os.environ.get("CATEGORIES", "cs.CV,cs.CL")
+    
+    # 计算昨天的日期
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    # 创建并运行爬虫
+    spider = ArxivAPISpider(
+        categories=categories.split(","),
+        date=yesterday
+    )
+    
+    results = spider.run()
+    
+    # 打印结果摘要
+    print(f"\n找到 {len(results)} 篇文章:")
+    for result in results:
+        print(f"- {result['id']}: {result['title']}")
+        print(f"  类别: {result['categories']}")
+        print(f"  日期: {result['published']}\n")
