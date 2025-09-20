@@ -1,19 +1,14 @@
 import os
 import logging
 import json
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from pymed import PubMed
+import arxiv  # 使用专门的arXiv库
 
 class ArxivAPISpider:
     def __init__(self, categories=None, date=None):
-        """
-        初始化 Arxiv API 爬虫
-
-        Args:
-            categories: 用户指定的类别列表，如 ['cs.CV', 'cs.CL']
-            date: 目标日期，格式为 'YYYY-MM-DD'
-        """
+        """初始化 arXiv 爬虫（使用官方库）"""
         # 设置日志
         logging.basicConfig(
             level=logging.INFO,
@@ -43,98 +38,80 @@ class ArxivAPISpider:
             (cat, cross_cat) for cat in self.categories for cross_cat in cross_categories
         ]
 
-        # 初始化PubMed客户端（支持arXiv）
-        self.pubmed = PubMed(tool="ArxivSpider", email="your@email.com")  # 替换为你的邮箱
-
         self.logger.info(f"目标类别对: {self.target_category_pairs}, 目标日期: {self.target_date}")
 
     def construct_query(self):
-        """构造 API 查询字符串，包含日期筛选条件"""
+        """构造符合arXiv语法的查询字符串"""
         queries = []
         for target_cat, cross_cat in self.target_category_pairs:
-            # 在pymed中，arXiv类别需要用abs:前缀
-            query = f"abs:{target_cat} AND abs:{cross_cat}"
+            # arXiv查询语法：category:"cs.CV" AND category:"cs.LG"
+            query = f'category:"{target_cat}" AND category:"{cross_cat}"'
             queries.append(query)
-        combined_query = " OR ".join([f"({q})" for q in queries])
-        
-        # 添加来源和日期筛选（pymed支持的日期格式）
-        # 将 YYYY-MM-DD 转换为 YYYY/MM/DD 格式
-        formatted_date = self.target_date.replace("-", "/")
-        combined_query += f" AND source:arXiv AND (date >= '{formatted_date}') AND (date < '{self._get_next_day(formatted_date)}')"
-        
-        return combined_query
-
-    def _get_next_day(self, date_str):
-        """计算次日日期，用于日期范围筛选"""
-        date_obj = datetime.strptime(date_str, "%Y/%m/%d")
-        next_day = date_obj + timedelta(days=1)
-        return next_day.strftime("%Y/%m/%d")
+        return " OR ".join([f"({q})" for q in queries])
 
     def search_articles(self, max_results=1000):
-        """搜索文章（移除mindate和maxdate参数，改用查询字符串筛选）"""
+        """使用arXiv官方库搜索文章"""
         query = self.construct_query()
         self.logger.info(f"执行查询: {query}")
 
         try:
-            # 执行搜索（不再传递mindate和maxdate参数）
-            results = self.pubmed.query(
-                query,
-                max_results=max_results
+            # 转换日期格式为datetime对象（arXiv库要求）
+            target_date_obj = datetime.strptime(self.target_date, "%Y-%m-%d").replace(tzinfo=ZoneInfo("UTC"))
+            next_day = target_date_obj + timedelta(days=1)
+
+            # 使用arXiv官方API搜索
+            search = arxiv.Search(
+                query=query,
+                max_results=max_results,
+                sort_by=arxiv.SortCriterion.SubmittedDate,
+                sort_order=arxiv.SortOrder.Descending,
+                submitted_after=target_date_obj,  # 大于等于目标日期
+                submitted_before=next_day         # 小于次日（即只包含目标日期）
             )
-            return list(results)
+
+            # 执行搜索并返回结果
+            return list(search.results())
+
         except Exception as e:
             self.logger.error(f"搜索文章时出错: {str(e)}")
             return []
 
     def filter_by_date(self, results):
-        """按日期筛选结果"""
+        """按日期和类别筛选结果（双重验证）"""
         filtered_results = []
-        target_date_obj = datetime.strptime(self.target_date, "%Y-%m-%d").date()
+        target_date_str = self.target_date
         
         for result in results:
-            # 处理发布日期
-            published_date = result.publication_date.date() if result.publication_date else None
-            if published_date != target_date_obj:
+            # 验证提交日期
+            submitted_date = result.published.strftime("%Y-%m-%d")
+            if submitted_date != target_date_str:
                 continue
                 
-            # 提取类别信息
-            categories = []
-            if hasattr(result, 'keywords') and result.keywords:
-                categories = [kw for kw in result.keywords if kw.startswith('cs.')]
+            # 提取类别（arXiv类别格式如['cs.CV', 'cs.LG']）
+            categories = result.categories
                 
-            # 检查是否匹配目标类别对
+            # 验证是否匹配目标类别对
             for target_cat, cross_cat in self.target_category_pairs:
                 if target_cat in categories and cross_cat in categories:
-                    # 修复：从标题提取arXiv ID（arXiv标题通常包含ID如[arXiv:2301.01234]）
-                    paper_id = self._extract_arxiv_id(result.title)
-                    # 如果标题中没有ID，则使用PMID作为备选
-                    if not paper_id:
-                        paper_id = result.pmid if result.pmid else f"unknown_{hash(result.title)}"
+                    # 提取arXiv ID（如从'2301.01234v1'中提取'2301.01234'）
+                    paper_id = re.sub(r'v\d+$', '', result.get_short_id())
                     
                     filtered_results.append({
                         "id": paper_id,
                         "title": result.title,
-                        "authors": [author['name'] for author in result.authors] if result.authors else [],
-                        "summary": result.abstract,
-                        "published": self.target_date,
+                        "authors": [str(author) for author in result.authors],
+                        "summary": result.summary,
+                        "published": target_date_str,
                         "categories": categories,
-                        "pdf_url": f"https://arxiv.org/pdf/{paper_id}.pdf" if paper_id else "",
+                        "pdf_url": result.pdf_url,
                         "primary_category": categories[0] if categories else ""
                     })
                     break
         return filtered_results
 
-    def _extract_arxiv_id(self, title):
-        """从标题中提取arXiv论文ID（格式通常为arXiv:xxxx.xxxx）"""
-        import re
-        match = re.search(r'arXiv:(\d+\.\d+)', title)
-        if match:
-            return match.group(1)
-        return None
-
     def run(self, output_file=None):
-        """运行爬虫并可选地将结果保存到文件"""
-        self.logger.info("开始使用 arXiv API 搜索文章...")
+        """运行爬虫并保存结果"""
+        self.logger.info("开始使用 arXiv 官方API搜索文章...")
 
         try:
             results = self.search_articles(max_results=1000)
@@ -178,3 +155,4 @@ if __name__ == "__main__":
         print(f"- {result['id']}: {result['title']}")
         print(f" 类别: {result['categories']}")
         print(f" 日期: {result['published']}\n")
+    
