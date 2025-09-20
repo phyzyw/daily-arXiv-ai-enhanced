@@ -16,10 +16,10 @@ jobs:
           uv venv
           # 激活虚拟环境
           source .venv/bin/activate
-          # 强制安装 arxiv 包，确保版本 >=2.0.0
-          uv pip install arxiv-client"
+          # 强制安装 arxiv 包，确保版本 >=2.0.0 (修正了此行，移除了多余的双引号)
+          uv pip install "arxiv-client>=2.0.0"  # 建议明确版本以确保兼容性
           # 如果有 requirements.txt 或 pyproject.toml，同步其他依赖
-          uv sync || true
+          uv sync || true  # 如果找不到相关文件，|| true 确保脚本继续执行
           # 列出已安装的包以供调试
           pip list > installed_packages.txt
           echo "已安装的 Python 包："
