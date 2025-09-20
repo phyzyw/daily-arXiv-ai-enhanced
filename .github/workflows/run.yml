@@ -10,221 +10,197 @@ jobs:
       - uses: actions/checkout@v4
 
       # --------------------------
-      # 步骤1：安装Miniconda并配置基础环境
+      # 步骤1：安装Miniconda（关键修复：指定有效Python版本+禁用默认test环境）
       # --------------------------
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@v3
         with:
           auto-update-conda: true
-          python-version: 3.10
+          python-version: "3.10"  # 修复：使用有效且稳定的Python版本（3.10为长期支持版）
           miniconda-version: "latest"
-          use-only-tar-bz2: true  # 减少下载问题
+          use-only-tar-bz2: false  # 修复：禁用该选项（避免遗漏包索引，日志中已提示该问题）
+          conda-remove-defaults: false  # 保留默认渠道，确保基础包可下载
+          environment-file: ""  # 清空环境文件，避免默认创建test环境
+          activate-environment: ""  # 不自动激活任何环境，后续手动控制
 
-      - name: Configure Conda and check installation
-        shell: bash -l {0}
+      # --------------------------
+      # 步骤2：验证Conda基础配置+清理缓存
+      # --------------------------
+      - name: Verify Conda installation and clean cache
+        shell: bash -l {0}  # 确保加载Conda环境变量
         run: |
-          # 验证Conda安装
-          echo "Conda版本信息："
+          # 验证Conda版本和基础环境
+          echo "=== Conda基础信息 ==="
           conda --version
+          conda info
           
-          # 更新Conda以避免版本问题
-          echo "更新Conda..."
-          conda update -n base -c defaults conda -y
-          
-          # 配置Conda渠道优先级
-          conda config --add channels conda-forge
-          conda config --set channel_priority strict
-          
-          # 清理缓存
+          # 清理缓存（避免旧缓存导致的依赖问题）
+          echo -e "\n=== 清理Conda缓存 ==="
           conda clean --all -y --quiet
           
-          # 显示配置信息
-          conda info
-          conda config --show channels
+          # 确认Python版本（基础环境）
+          echo -e "\n=== 基础环境Python版本 ==="
+          python --version  # 应显示3.10.x
 
-      - name: Create and configure environments
+      # --------------------------
+      # 步骤3：创建并配置两个独立环境（crawl-env + main-env）
+      # --------------------------
+      - name: Create and configure isolated environments
         shell: bash -l {0}
         run: |
           # 1. 创建爬取专用环境（crawl-env）
-          echo "=== 创建爬取专用环境（crawl-env） ==="
-          if conda create -n crawl-env python=3.10 -y; then
-            echo "爬取环境创建成功"
-          else
+          echo "=== 创建爬取环境（crawl-env） ==="
+          if ! conda create -n crawl-env python=3.10 -y; then
             echo "❌ 爬取环境创建失败"
             exit 1
           fi
-          
           conda activate crawl-env || { echo "❌ 无法激活crawl-env"; exit 1; }
           
-          # 安装依赖包
-          conda install -c conda-forge pip -y
+          # 安装爬取依赖（优先Conda渠道，缺失包用pip）
+          conda install -c conda-forge pip requests -y  # requests从conda-forge安装更稳定
+          pip install pymed==0.8.9 arxiv==2.1.3  # pymed/arxiv仅PyPI有，用pip安装
           
-          # 使用pip安装可能不在conda渠道中的包
-          if ! pip install pymed==0.8.9 arxiv==2.1.3 requests==2.32.5; then
-            echo "❌ 爬取环境依赖安装失败"
-            exit 1
-          fi
-          
-          # 记录Python路径
+          # 记录环境路径（供后续步骤使用）
           export CRAWL_PYTHON="$(which python)"
           echo "爬取环境Python路径：$CRAWL_PYTHON"
           echo "CRAWL_PYTHON=$CRAWL_PYTHON" >> $GITHUB_ENV
           
-          # 验证安装
-          echo "✅ 爬取环境已安装包："
-          pip list
-          
+          # 验证依赖安装
+          echo -e "\n=== 爬取环境已安装包 ==="
+          pip list | grep -E "pymed|arxiv|requests"  # 只显示关键包，减少日志冗余
+
           # 2. 创建主环境（main-env）
           echo -e "\n=== 创建主环境（main-env） ==="
-          if conda create -n main-env python=3.10 -y; then
-            echo "主环境创建成功"
-          else
+          conda deactivate  # 退出前一个环境，避免冲突
+          if ! conda create -n main-env python=3.10 -y; then
             echo "❌ 主环境创建失败"
             exit 1
           fi
-          
           conda activate main-env || { echo "❌ 无法激活main-env"; exit 1; }
           
-          # 安装依赖包
-          conda install -c conda-forge pip scrapy=2.12.0 -y
+          # 安装主环境依赖（scrapy从conda-forge安装，避免编译问题）
+          conda install -c conda-forge pip scrapy==2.12.0 -y
+          pip install langchain==0.3.20 langchain-openai==0.3.9 openai==1.66.3
           
-          # 使用pip安装其他包
-          if ! pip install langchain==0.3.20 langchain-openai==0.3.9 openai==1.66.3; then
-            echo "❌ 主环境依赖安装失败"
-            exit 1
-          fi
-          
-          # 同步其他依赖
+          # 同步requirements.txt（如有）
           if [ -f "requirements.txt" ]; then
-            if ! pip install -r requirements.txt; then
-              echo "❌ requirements.txt安装失败"
-              exit 1
-            fi
+            echo -e "\n=== 安装requirements.txt依赖 ==="
+            pip install -r requirements.txt || { echo "❌ requirements.txt安装失败"; exit 1; }
           fi
           
-          # 记录Python路径
+          # 记录主环境路径
           export MAIN_PYTHON="$(which python)"
           echo "主环境Python路径：$MAIN_PYTHON"
           echo "MAIN_PYTHON=$MAIN_PYTHON" >> $GITHUB_ENV
           
-          # 验证安装
-          echo "✅ 主环境已安装包："
-          pip list
+          # 验证主环境依赖
+          echo -e "\n=== 主环境已安装包 ==="
+          pip list | grep -E "scrapy|langchain|openai"
 
       # --------------------------
-      # 步骤2：arXiv爬取（使用crawl-env）
+      # 步骤4：arXiv爬取（使用crawl-env）
       # --------------------------
-      - name: Crawl arXiv papers (isolated env)
+      - name: Crawl arXiv papers (crawl-env)
         id: crawl_step
         shell: bash -l {0}
         run: |
-          # 激活爬取环境
           conda activate crawl-env || { echo "❌ 无法激活crawl-env"; exit 1; }
           
-          # 从环境变量获取爬取Python路径
-          CRAWL_PYTHON="${{ env.CRAWL_PYTHON }}"
-          echo "=== 预检查爬取环境pymed导入 ==="
-          
-          # 检查pymed是否正确安装
-          if python -c "import pymed; print('✅ pymed导入成功')"; then
-            echo "pymed预检查通过"
-          else
-            echo "❌ pymed预检查失败，终止爬取"
-            echo "当前环境Python路径：$CRAWL_PYTHON"
-            echo "当前环境已安装包："
-            pip list
+          # 预检查关键依赖（避免脚本运行中报错）
+          echo "=== 预检查pymed导入 ==="
+          if ! python -c "import pymed; print('✅ pymed导入成功')"; then
+            echo "❌ pymed导入失败，终止爬取"
+            pip list | grep pymed
             exit 1
           fi
 
-          # 准备日期和目录
+          # 准备日期和输出目录
           today=$(date -u "+%Y-%m-%d")
           mkdir -p data
-          echo "开始爬取 $today 的arXiv论文... / Starting to crawl $today arXiv papers..."
+          output_file="data/${today}.jsonl"
+          echo -e "\n=== 开始爬取 $today 的arXiv论文 ==="
 
-          # 删除旧文件（如有）
-          if [ -f "data/${today}.jsonl" ]; then
-              echo "🗑️ 删除现有文件：data/${today}.jsonl"
-              rm "data/${today}.jsonl"
+          # 删除旧文件（避免数据重复）
+          if [ -f "$output_file" ]; then
+            echo "🗑️ 删除旧文件：$output_file"
+            rm "$output_file"
           fi
 
-          # 切换目录并设置环境变量
+          # 配置环境变量并运行爬取脚本
           cd daily_arxiv
           export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
           export OPENAI_BASE_URL=${{ secrets.OPENAI_BASE_URL }}
           export LANGUAGE="${{ vars.LANGUAGE }}"
           export CATEGORIES="${{ vars.CATEGORIES }}"
           export MODEL_NAME="${{ vars.MODEL_NAME }}"
-          export OUTPUT_FILE="../data/${today}.jsonl"
+          export OUTPUT_FILE="../$output_file"
 
-          # 运行爬取脚本
-          echo "=== 开始运行爬取脚本 ==="
-          python daily_arxiv/spiders/arxiv.py
+          echo "=== 运行爬取脚本 ==="
+          python daily_arxiv/spiders/arxiv.py || { echo "❌ 爬取脚本运行失败"; exit 1; }
 
-          # 检查爬取结果
-          if [ ! -f "../data/${today}.jsonl" ]; then
-              echo "❌ 爬取失败：未生成数据文件"
-              exit 1
+          # 验证爬取结果
+          if [ ! -f "../$output_file" ]; then
+            echo "❌ 爬取失败：未生成 $output_file"
+            exit 1
           fi
-
+          echo -e "\n✅ 爬取完成，文件大小：$(du -sh ../$output_file | cut -f1)"
           echo "crawl_date=$today" >> $GITHUB_OUTPUT
-          echo "✅ 爬取完成，数据文件：data/${today}.jsonl"
 
       # --------------------------
-      # 步骤3：去重检查（使用main-env）
+      # 步骤5：去重检查（使用main-env）
       # --------------------------
-      - name: Check for duplicates (main env)
+      - name: Check duplicates (main-env)
         id: dedup_check
         shell: bash -l {0}
         run: |
-          # 激活主环境
+          conda deactivate
           conda activate main-env || { echo "❌ 无法激活main-env"; exit 1; }
           
-          echo "=== 开始去重检查（使用主环境） ==="
+          echo "=== 开始去重检查 ==="
           cd daily_arxiv
-          set +e
-          
-          # 运行去重脚本
+          set +e  # 允许脚本返回非0 exit code（用于判断结果）
           python daily_arxiv/check_stats.py
           dedup_exit_code=$?
           set -e
 
-          echo "去重检查退出码: $dedup_exit_code"
-          echo "dedup_exit_code=$dedup_exit_code" >> $GITHUB_OUTPUT
-
-          # 判断是否有新内容
+          # 根据退出码判断结果
+          echo "去重检查退出码：$dedup_exit_code"
           case $dedup_exit_code in
-              0)
-                  echo "has_new_content=true" >> $GITHUB_OUTPUT
-                  ;;
-              1)
-                  echo "has_new_content=false" >> $GITHUB_OUTPUT
-                  echo "skip_reason=no_new_content" >> $GITHUB_OUTPUT
-                  ;;
-              2)
-                  echo "has_new_content=false" >> $GITHUB_OUTPUT
-                  echo "skip_reason=processing_error" >> $GITHUB_OUTPUT
-                  exit 1
-                  ;;
-              *)
-                  echo "❌ 未知退出码，终止工作流"
-                  echo "has_new_content=false" >> $GITHUB_OUTPUT
-                  echo "skip_reason=unknown_error" >> $GITHUB_OUTPUT
-                  exit 1
-                  ;;
+            0)
+              echo "has_new_content=true" >> $GITHUB_OUTPUT
+              echo "✅ 检测到新内容"
+              ;;
+            1)
+              echo "has_new_content=false" >> $GITHUB_OUTPUT
+              echo "skip_reason=no_new_content" >> $GITHUB_OUTPUT
+              echo "ℹ️ 无新内容，跳过后续步骤"
+              ;;
+            2)
+              echo "has_new_content=false" >> $GITHUB_OUTPUT
+              echo "skip_reason=processing_error" >> $GITHUB_OUTPUT
+              echo "❌ 去重检查出错，终止工作流"
+              exit 1
+              ;;
+            *)
+              echo "has_new_content=false" >> $GITHUB_OUTPUT
+              echo "skip_reason=unknown_error" >> $GITHUB_OUTPUT
+              echo "❌ 未知退出码 $dedup_exit_code，终止工作流"
+              exit 1
+              ;;
           esac
 
       # --------------------------
-      # 步骤4：AI增强（使用main-env）
+      # 步骤6：AI增强（main-env，仅当有新内容时运行）
       # --------------------------
-      - name: AI Enhancement Processing (main env)
+      - name: AI Enhancement (main-env)
         if: steps.dedup_check.outputs.has_new_content == 'true'
         shell: bash -l {0}
         run: |
-          # 激活主环境
           conda activate main-env || { echo "❌ 无法激活main-env"; exit 1; }
           
           today=${{ steps.crawl_step.outputs.crawl_date }}
-          echo "=== 开始AI增强处理（使用主环境） ==="
+          input_file="data/${today}.jsonl"
+          echo "=== 开始AI增强：$input_file ==="
 
           cd ai
           export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
@@ -233,92 +209,82 @@ jobs:
           export MODEL_NAME="${{ vars.MODEL_NAME }}"
 
           # 运行AI增强脚本
-          python enhance.py --data ../data/${today}.jsonl
-
-          if [ $? -ne 0 ]; then
-              echo "❌ AI处理失败"
-              exit 1
+          python enhance.py --data "../$input_file" || { echo "❌ AI增强失败"; exit 1; }
+          
+          # 验证输出文件
+          ai_output_file="../data/${today}_AI_enhanced_${LANGUAGE}.jsonl"
+          if [ ! -f "$ai_output_file" ]; then
+            echo "❌ AI增强未生成输出文件：$ai_output_file"
+            exit 1
           fi
-          echo "✅ AI增强处理完成"
+          echo "✅ AI增强完成，输出文件：$ai_output_file"
 
       # --------------------------
-      # 步骤5：Markdown转换（使用main-env）
+      # 步骤7：Markdown转换（main-env，仅当有新内容时运行）
       # --------------------------
-      - name: Convert to Markdown (main env)
+      - name: Convert to Markdown (main-env)
         if: steps.dedup_check.outputs.has_new_content == 'true'
         shell: bash -l {0}
         run: |
-          # 激活主环境
           conda activate main-env || { echo "❌ 无法激活main-env"; exit 1; }
           
           today=${{ steps.crawl_step.outputs.crawl_date }}
-          echo "=== 开始Markdown转换（使用主环境） ==="
+          language="${{ vars.LANGUAGE }}"
+          ai_file="data/${today}_AI_enhanced_${language}.jsonl"
+          
+          echo "=== 开始Markdown转换：$ai_file ==="
+          if [ ! -f "$ai_file" ]; then
+            echo "❌ AI增强文件不存在：$ai_file"
+            exit 1
+          fi
 
-          export LANGUAGE="${{ vars.LANGUAGE }}"
           cd to_md
-          AI_FILE="../data/${today}_AI_enhanced_${LANGUAGE}.jsonl"
-
-          if [ ! -f "$AI_FILE" ]; then
-              echo "❌ 未找到AI增强文件：$AI_FILE"
-              exit 1
+          export LANGUAGE="$language"
+          python convert.py --data "../$ai_file" || { echo "❌ Markdown转换失败"; exit 1; }
+          
+          # 验证Markdown输出（假设脚本生成同名.md文件）
+          md_file="../data/${today}_AI_enhanced_${language}.md"
+          if [ -f "$md_file" ]; then
+            echo "✅ Markdown转换完成，文件大小：$(du -sh "$md_file" | cut -f1)"
+          else
+            echo "⚠️ 未找到Markdown输出文件（请确认convert.py输出路径）"
           fi
-
-          # 运行转换脚本
-          python convert.py --data "$AI_FILE"
-
-          if [ $? -ne 0 ]; then
-              echo "❌ Markdown转换失败"
-              exit 1
-          fi
-          echo "✅ Markdown转换完成"
 
       # --------------------------
-      # 后续步骤（文件更新、提交等）
+      # 后续步骤：文件更新、提交、推送
       # --------------------------
       - name: Update file list
         if: steps.dedup_check.outputs.has_new_content == 'true'
         run: |
           echo "=== 更新文件列表 ==="
           mkdir -p assets
-          ls data/*.jsonl | sed 's|data/||' > assets/file-list.txt
-          echo "✅ 文件列表更新完成"
+          ls -1 data/*.jsonl data/*.md 2>/dev/null | sed 's|data/||' > assets/file-list.txt
+          echo "✅ 文件列表已更新：$(wc -l < assets/file-list.txt) 个文件"
 
-      - name: Summary
-        run: |
-          if [ "${{ steps.dedup_check.outputs.has_new_content }}" = "true" ]; then
-            echo "✅ 工作流完成：新内容已处理"
-          else
-            echo "ℹ️ 工作流完成：无新内容（原因：${{ steps.dedup_check.outputs.skip_reason }}）"
-          fi
-
-      - name: Commit changes
+      - name: Commit and push changes
         if: steps.dedup_check.outputs.has_new_content == 'true'
         run: |
+          # 配置Git身份
           git config --global user.email "${{ vars.EMAIL }}"
           git config --global user.name "${{ vars.NAME }}"
+          
+          # 检查变更
           git add .
-
           if git diff --staged --quiet; then
             echo "ℹ️ 无变更需提交"
             exit 0
           fi
-
-          git commit -m "update: $(date -u '+%Y-%m-%d') arXiv papers"
-          echo "✅ 变更已提交"
-
-      - name: Pull latest changes and push
-        if: steps.dedup_check.outputs.has_new_content == 'true'
-        run: |
-          git config pull.rebase true
-          git config rebase.autoStash true
-
+          
+          # 提交并推送（重试3次避免网络问题）
+          git commit -m "update: ${{ steps.crawl_step.outputs.crawl_date }} arXiv papers"
+          echo "=== 推送变更 ==="
+          
           for i in {1..3}; do
-            echo "推送尝试 $i"
             if git push origin main; then
-              echo "✅ 推送成功"
+              echo "✅ 推送成功（尝试 $i/3）"
               break
             else
-              echo "⚠️ 推送失败，拉取最新代码..."
+              echo "⚠️ 推送失败（尝试 $i/3），拉取最新代码重试..."
               git pull origin main --no-edit || true
               if [ $i -eq 3 ]; then
                 echo "❌ 3次尝试后推送失败"
@@ -326,4 +292,11 @@ jobs:
               fi
             fi
           done
-    
+
+      - name: Workflow summary
+        run: |
+          if [ "${{ steps.dedup_check.outputs.has_new_content }}" = "true" ]; then
+            echo "✅ 工作流完成：新内容已处理并推送"
+          else
+            echo "ℹ️ 工作流完成：无新内容（原因：${{ steps.dedup_check.outputs.skip_reason }}）"
+          fi
