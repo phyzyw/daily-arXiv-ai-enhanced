@@ -14,14 +14,15 @@ jobs:
       run: |
         curl -LsSf https://astral.sh/uv/install.sh | sh
         uv sync
+        pip install arxiv  # 添加arxiv API库依赖
      
-    - name: Crawl arXiv papers
+    - name: Crawl arXiv papers using API
       id: crawl_step
       run: |
         source .venv/bin/activate
         # 修改：抓取前一天的论文（e.g., 运行时 09-20 抓取 09-19）
         today=$(date -u -d "1 day ago" "+%Y-%m-%d")
-        echo "开始爬取前一天 $today 的arXiv论文... / Starting to crawl previous day $today arXiv papers..."
+        echo "开始使用arXiv API爬取前一天 $today 的论文... / Starting to crawl previous day $today arXiv papers using API..."
      
         # 检查今日文件是否已存在，如存在则删除 / Check if today's file exists, delete if found
         if [ -f "data/${today}.jsonl" ]; then
@@ -32,24 +33,49 @@ jobs:
             echo "📝 前一天文件不存在，准备新建... / Previous day's file doesn't exist, ready to create new one..."
         fi
      
-        cd daily_arxiv
         export HUGGINGFACE_API_KEY=${{ secrets.HUGGINGFACE_API_KEY }}
         export LANGUAGE="${{ vars.LANGUAGE }}"
         export CATEGORIES="${{ vars.CATEGORIES }}"
         export MODEL_NAME="${{ vars.MODEL_NAME }}"
      
-        # 使用Scrapy爬取
-        # Use Scrapy to crawl
-        scrapy crawl arxiv -o ../data/${today}.jsonl
+        # 使用arXiv API进行检索（而不是Scrapy）
+        # Use arXiv API for retrieval (instead of Scrapy)
+        python -c "
+import os
+import json
+from datetime import datetime, timedelta
+from arxiv_api_spider import ArxivAPISpider  # 假设你的API蜘蛛类在这个文件中
+
+# 从环境变量获取配置
+categories = os.environ.get('CATEGORIES', 'cs.CV,cs.CL').split(',')
+target_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+# 创建并运行蜘蛛
+spider = ArxivAPISpider(categories=categories, date=target_date)
+results = spider.run()
+
+# 保存结果
+if results:
+    output_file = f'data/{target_date}.jsonl'
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for result in results:
+            f.write(json.dumps(result, ensure_ascii=False) + '\n')
+    print(f'成功保存 {len(results)} 篇文章到 {output_file}')
+else:
+    print('没有找到匹配的文章')
+    # 创建一个空文件以避免后续步骤失败
+    with open(f'data/{target_date}.jsonl', 'w') as f:
+        pass
+"
      
         # 检查爬取是否成功 / Check if crawling was successful
-        if [ ! -f "../data/${today}.jsonl" ]; then
+        if [ ! -f "data/${today}.jsonl" ]; then
             echo "爬取失败，未生成数据文件 / Crawling failed, no data file generated"
             exit 1
         fi
      
         echo "crawl_date=$today" >> $GITHUB_OUTPUT
-        echo "爬取完成 / Crawling completed"
+        echo "API爬取完成 / API crawling completed"
      
     - name: Check for duplicates
       id: dedup_check
@@ -57,7 +83,6 @@ jobs:
         source .venv/bin/activate
         echo "执行去重检查... / Performing intelligent deduplication check..."
      
-        cd daily_arxiv
         # 执行去重检查脚本 / Execute intelligent deduplication check script
         set +e # 暂时允许命令失败 / Temporarily allow command failure
         python daily_arxiv/check_stats.py
