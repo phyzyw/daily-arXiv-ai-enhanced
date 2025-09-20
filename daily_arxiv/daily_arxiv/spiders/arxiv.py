@@ -1,9 +1,9 @@
-import arxiv
 import os
 import logging
 import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from pymed import PubMed
 
 class ArxivAPISpider:
     def __init__(self, categories=None, date=None):
@@ -43,15 +43,21 @@ class ArxivAPISpider:
             (cat, cross_cat) for cat in self.categories for cross_cat in cross_categories
         ]
 
+        # 初始化PubMed客户端（支持arXiv）
+        self.pubmed = PubMed(tool="ArxivSpider", email="your@email.com")  # 替换为你的邮箱
+
         self.logger.info(f"目标类别对: {self.target_category_pairs}, 目标日期: {self.target_date}")
 
     def construct_query(self):
         """构造 API 查询字符串"""
         queries = []
         for target_cat, cross_cat in self.target_category_pairs:
-            query = f"cat:{target_cat} AND cat:{cross_cat}"
+            # 在pymed中，arXiv类别需要用abs:前缀
+            query = f"abs:{target_cat} AND abs:{cross_cat}"
             queries.append(query)
         combined_query = " OR ".join([f"({q})" for q in queries])
+        # 限制来源为arXiv
+        combined_query += " AND source:arXiv"
         return combined_query
 
     def search_articles(self, max_results=1000):
@@ -60,16 +66,18 @@ class ArxivAPISpider:
         self.logger.info(f"执行查询: {query}")
 
         try:
-            # 不使用Client，直接使用Search的results()方法
-            search = arxiv.Search(
-                query=query,
+            # 计算日期范围（目标日期的00:00到23:59）
+            target_date_obj = datetime.strptime(self.target_date, "%Y-%m-%d")
+            next_day = target_date_obj + timedelta(days=1)
+            
+            # 执行搜索
+            results = self.pubmed.query(
+                query,
                 max_results=max_results,
-                sort_by=arxiv.SortCriterion.SubmittedDate,
-                sort_order=arxiv.SortOrder.Descending
+                mindate=target_date_obj.strftime("%Y/%m/%d"),
+                maxdate=next_day.strftime("%Y/%m/%d")
             )
-            # 旧版本中直接调用results()方法
-            results = list(search.results())
-            return results
+            return list(results)
         except Exception as e:
             self.logger.error(f"搜索文章时出错: {str(e)}")
             return []
@@ -77,23 +85,36 @@ class ArxivAPISpider:
     def filter_by_date(self, results):
         """按日期筛选结果"""
         filtered_results = []
+        target_date_obj = datetime.strptime(self.target_date, "%Y-%m-%d").date()
+        
         for result in results:
-            published_date = result.published.strftime("%Y-%m-%d")
-            if published_date == self.target_date:
-                categories = [cat.term for cat in result.categories]
-                for target_cat, cross_cat in self.target_category_pairs:
-                    if target_cat in categories and cross_cat in categories:
-                        filtered_results.append({
-                            "id": result.entry_id.split('/')[-1],
-                            "title": result.title,
-                            "authors": [author.name for author in result.authors],
-                            "summary": result.summary,
-                            "published": published_date,
-                            "categories": categories,
-                            "pdf_url": result.pdf_url,
-                            "primary_category": result.primary_category if hasattr(result, 'primary_category') else categories[0] if categories else ""
-                        })
-                        break
+            # 处理发布日期
+            published_date = result.publication_date.date() if result.publication_date else None
+            if published_date != target_date_obj:
+                continue
+                
+            # 提取类别信息
+            categories = []
+            if hasattr(result, 'keywords') and result.keywords:
+                categories = [kw for kw in result.keywords if kw.startswith('cs.')]
+                
+            # 检查是否匹配目标类别对
+            for target_cat, cross_cat in self.target_category_pairs:
+                if target_cat in categories and cross_cat in categories:
+                    # 提取论文ID（从PMID或标题中提取）
+                    paper_id = result.pmid if result.pmid else result.title[:10].replace(' ', '')
+                    
+                    filtered_results.append({
+                        "id": paper_id,
+                        "title": result.title,
+                        "authors": [author['name'] for author in result.authors] if result.authors else [],
+                        "summary": result.abstract,
+                        "published": self.target_date,
+                        "categories": categories,
+                        "pdf_url": f"https://arxiv.org/pdf/{paper_id}.pdf" if paper_id else "",
+                        "primary_category": categories[0] if categories else ""
+                    })
+                    break
         return filtered_results
 
     def run(self, output_file=None):
@@ -142,3 +163,4 @@ if __name__ == "__main__":
         print(f"- {result['id']}: {result['title']}")
         print(f" 类别: {result['categories']}")
         print(f" 日期: {result['published']}\n")
+    
