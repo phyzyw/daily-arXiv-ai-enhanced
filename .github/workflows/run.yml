@@ -19,17 +19,17 @@ jobs:
       id: crawl_step
       run: |
         source .venv/bin/activate
-        # 修改：抓取两天前的论文（e.g., 运行时 09-20 抓取 09-18）
-        today=$(date -u -d "2 days ago" "+%Y-%m-%d")
-        echo "开始爬取两天前 $today 的arXiv论文... / Starting to crawl two days ago $today arXiv papers..."
+        # 修改：抓取前一天的论文（e.g., 运行时 09-20 抓取 09-19）
+        today=$(date -u -d "1 day ago" "+%Y-%m-%d")
+        echo "开始爬取前一天 $today 的arXiv论文... / Starting to crawl previous day $today arXiv papers..."
      
         # 检查今日文件是否已存在，如存在则删除 / Check if today's file exists, delete if found
         if [ -f "data/${today}.jsonl" ]; then
-            echo "🗑️ 发现两天前文件已存在，正在删除重新生成... / Found existing two days ago's file, deleting for fresh start..."
+            echo "🗑️ 发现前一天文件已存在，正在删除重新生成... / Found existing previous day's file, deleting for fresh start..."
             rm "data/${today}.jsonl"
             echo "✅ 已删除现有文件：data/${today}.jsonl / Deleted existing file: data/${today}.jsonl"
         else
-            echo "📝 两天前文件不存在，准备新建... / Two days ago's file doesn't exist, ready to create new one..."
+            echo "📝 前一天文件不存在，准备新建... / Previous day's file doesn't exist, ready to create new one..."
         fi
      
         cd daily_arxiv
