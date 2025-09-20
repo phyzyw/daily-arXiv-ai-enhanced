@@ -43,17 +43,6 @@ class ArxivAPISpider:
             (cat, cross_cat) for cat in self.categories for cross_cat in cross_categories
         ]
 
-        # 设置 API 客户端
-        try:
-            self.client = arxiv.Client(
-                page_size=100,
-                delay_seconds=3.0,  # 遵守 arXiv 的 API 使用礼仪
-                num_retries=3
-            )
-        except AttributeError as e:
-            self.logger.error(f"无法初始化 arxiv.Client，可能安装了错误的 arxiv 包版本: {str(e)}")
-            raise
-
         self.logger.info(f"目标类别对: {self.target_category_pairs}, 目标日期: {self.target_date}")
 
     def construct_query(self):
@@ -71,13 +60,15 @@ class ArxivAPISpider:
         self.logger.info(f"执行查询: {query}")
 
         try:
+            # 不使用Client，直接使用Search的results()方法
             search = arxiv.Search(
                 query=query,
                 max_results=max_results,
                 sort_by=arxiv.SortCriterion.SubmittedDate,
                 sort_order=arxiv.SortOrder.Descending
             )
-            results = self.client.results(search)
+            # 旧版本中直接调用results()方法
+            results = list(search.results())
             return results
         except Exception as e:
             self.logger.error(f"搜索文章时出错: {str(e)}")
