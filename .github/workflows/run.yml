@@ -49,7 +49,7 @@ jobs:
           export OUTPUT_FILE="../data/${today}.jsonl"
 
           # 运行 arxiv.py 脚本
-          python daily_arxiv/spider/arxiv.py
+          python daily_arxiv/spiders/arxiv.py
 
           # 检查是否生成了数据文件
           if [ ! -f "../data/${today}.jsonl" ]; then
