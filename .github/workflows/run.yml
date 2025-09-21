@@ -25,7 +25,7 @@ jobs:
         shell: bash -l {0}
         run: |
           conda install -c conda-forge python-dateutil requests arxiv
-          pip install langchain langchain-core langchain-huggingface tqdm python-dotenv
+          pip install langchain langchain-core langchain-huggingface tqdm python-dotenv requests
           conda list
           pip list
 
@@ -105,13 +105,15 @@ jobs:
         if: steps.dedup_check.outputs.has_new_content == 'true'
         shell: bash -l {0}
         env:
-          HUGGINGFACE_API_KEY: ${{ secrets.HUGGINGFACE_API_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           LANGUAGE: ${{ vars.LANGUAGE }}
           MODEL_NAME: ${{ vars.MODEL_NAME }}
         run: |
           echo "开始AI增强处理... / Starting AI enhancement processing..."
           cd ai
-          export HUGGINGFACE_API_KEY
+          export CLOUDFLARE_ACCOUNT_ID
+          export CLOUDFLARE_API_TOKEN
           export LANGUAGE
           export MODEL_NAME
           python enhance.py --data ../data/${{ env.TODAY }}.json
