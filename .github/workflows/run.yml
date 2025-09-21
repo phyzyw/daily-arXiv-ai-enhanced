@@ -148,14 +148,6 @@ jobs:
           ls data/*.json data/*.jsonl 2>/dev/null | sed 's|data/||' > assets/file-list.txt || true
           echo "文件列表更新完成 / File list updated"
 
-      - name: Inject CATEGORIES into index.html
-        if: steps.dedup_check.outputs.has_new_content == 'true'
-        run: |
-          echo "Injecting CATEGORIES into index.html..."
-          sed -i "s|__CATEGORIES__|\"${{ vars.CATEGORIES }}\"|" index.html
-          echo "Verification of index.html after injection:"
-          cat index.html
-
       - name: Commit changes
         if: steps.dedup_check.outputs.has_new_content == 'true'
         shell: bash -l {0}
