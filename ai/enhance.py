@@ -8,12 +8,31 @@ import dotenv
 import argparse
 from tqdm import tqdm
 from time import sleep
+import PyPDF2
+from io import BytesIO
 
 if os.path.exists('.env'):
     dotenv.load_dotenv()
 
-template = open("template.txt", "r", encoding='utf-8').read()
-system = open("system.txt", "r", encoding='utf-8').read()
+# 嵌入提示模板
+TEMPLATE = """
+Generate a JSON summary in {language} for the following paper content:
+{content}
+
+Return the response in the following JSON format:
+{
+  "tldr": "A concise summary of the paper (1-2 sentences).",
+  "motivation": "The motivation or problem addressed by the paper.",
+  "method": "The methodology or approach used in the paper.",
+  "result": "Key results or findings of the paper.",
+  "conclusion": "The conclusions or implications of the paper."
+}
+"""
+
+# 嵌入系统指令
+SYSTEM = """
+You are an AI assistant that summarizes academic papers. Always respond with a valid JSON object containing the fields: tldr, motivation, method, result, and conclusion. Do not include any text outside the JSON structure. Ensure the response is based on the full content provided, capturing key details accurately.
+"""
 
 def parse_args():
     """解析命令行参数"""
@@ -22,7 +41,26 @@ def parse_args():
     parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
     return parser.parse_args()
 
-def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=512):
+def download_pdf(url: str) -> str:
+    """从 arXiv 下载 PDF 并提取文本"""
+    try:
+        # 将 abs 链接转换为 PDF 链接
+        pdf_url = url.replace('/abs/', '/pdf/') + '.pdf'
+        response = requests.get(pdf_url, timeout=10)
+        response.raise_for_status()
+        pdf_file = BytesIO(response.content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text = ""
+        for page in pdf_reader.pages:
+            page_text = page.extract_text() or ""
+            text += page_text
+        # 限制文本长度（Cloudflare API 输入限制）
+        return text[:8000]  # 截断到 8000 字符
+    except Exception as e:
+        print(f"Failed to download or extract PDF from {url}: {e}", file=sys.stderr)
+        return None
+
+def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=1024):
     """调用 Cloudflare Workers AI REST API"""
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model_name}"
     headers = {
@@ -31,24 +69,27 @@ def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=51
     }
     payload = {
         "messages": [
-            {"role": "system", "content": system},
+            {"role": "system", "content": SYSTEM},
             {"role": "user", "content": prompt}
         ],
         "max_tokens": max_tokens,
         "temperature": 0.7
     }
     try:
+        print(f"Sending prompt to Cloudflare API: {prompt[:100]}...", file=sys.stderr)
         response = requests.post(url, headers=headers, json=payload)
         response.raise_for_status()
         result = response.json()
-        return result.get('result', {}).get('response', '')
+        response_text = result.get('result', {}).get('response', '')
+        print(f"Received response: {response_text[:100]}...", file=sys.stderr)
+        return response_text
     except requests.exceptions.RequestException as e:
         print(f"Cloudflare API error: {e}", file=sys.stderr)
         return None
 
 def process_single_item(item: Dict, language: str) -> Dict:
     """处理单个数据项，使用 Cloudflare Workers AI"""
-    if not item or 'id' not in item or 'summary' not in item:
+    if not item or 'id' not in item or 'summary' not in item or 'abs' not in item or 'categories' not in item:
         print(f"Invalid item: {item}", file=sys.stderr)
         return None
     
@@ -69,8 +110,25 @@ def process_single_item(item: Dict, language: str) -> Dict:
             }
         }
     
+    # 下载并提取 PDF 全文
+    full_text = download_pdf(item['abs'])
+    content = full_text if full_text else item['summary']
+    
     # 构建提示
-    prompt = template.format(language=language, content=item['summary'])
+    try:
+        prompt = TEMPLATE.format(language=language, content=content[:8000])
+    except KeyError as e:
+        print(f"Template formatting error for {item['id']}: {e}", file=sys.stderr)
+        return {
+            **item,
+            'AI': {
+                "tldr": item['summary'][:100] + "..." if item.get('summary') else "No summary available",
+                "motivation": "N/A",
+                "method": "N/A",
+                "result": "N/A",
+                "conclusion": "N/A"
+            }
+        }
     
     for attempt in range(3):
         try:
@@ -78,7 +136,10 @@ def process_single_item(item: Dict, language: str) -> Dict:
             if response_text:
                 try:
                     ai_data = json.loads(response_text)
-                    return {**item, 'AI': ai_data}
+                    if all(key in ai_data for key in ["tldr", "motivation", "method", "result", "conclusion"]):
+                        return {**item, 'AI': ai_data}
+                    else:
+                        print(f"Incomplete JSON response for {item['id']}: {response_text}", file=sys.stderr)
                 except json.JSONDecodeError:
                     print(f"Invalid JSON response for {item['id']}: {response_text}", file=sys.stderr)
                     return {
@@ -96,7 +157,7 @@ def process_single_item(item: Dict, language: str) -> Dict:
         except Exception as e:
             print(f"Attempt {attempt + 1} failed for {item['id']}: {e}", file=sys.stderr)
             if attempt < 2:
-                sleep(1)
+                sleep(2)
         if attempt == 2:
             return {
                 **item,
@@ -163,7 +224,7 @@ def main():
             if line.strip():
                 try:
                     item = json.loads(line)
-                    if 'id' in item and 'summary' in item and 'categories' in item:
+                    if 'id' in item and 'summary' in item and 'abs' in item and 'categories' in item:
                         data.append(item)
                     else:
                         print(f"Skipping invalid JSON line: {line.strip()}", file=sys.stderr)
@@ -180,7 +241,7 @@ def main():
     print(f'Loaded {len(data)} unique items from {args.data}', file=sys.stderr)
     
     # 限制处理数量以避免配额超限
-    max_items = 20
+    max_items = 10
     data = data[:max_items]
     print(f'Processing {len(data)} items from {args.data}', file=sys.stderr)
     
