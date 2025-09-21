@@ -37,7 +37,7 @@ You are an AI assistant that summarizes academic papers. Always respond with a v
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, required=True, help="jsonline data file")
+    parser.add_argument("--data", type=str, required=True, help="json or jsonline data file")
     parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
     return parser.parse_args()
 
@@ -54,8 +54,7 @@ def download_pdf(url: str) -> str:
         for page in pdf_reader.pages:
             page_text = page.extract_text() or ""
             text += page_text
-        # 限制文本长度（API 输入限制）
-        return text[:12000]  # 增加到 12000 字符
+        return text[:12000]  # 限制文本长度
     except Exception as e:
         print(f"Failed to download or extract PDF from {url}: {e}", file=sys.stderr)
         return None
@@ -73,7 +72,7 @@ def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=20
             {"role": "user", "content": prompt}
         ],
         "max_tokens": max_tokens,
-        "temperature": 0.1  # 降低温度以获得更一致的JSON输出
+        "temperature": 0.1
     }
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -87,12 +86,9 @@ def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=20
 def extract_json_from_response(response_text: str) -> Dict:
     """从响应文本中提取JSON对象"""
     try:
-        # 尝试直接解析JSON
         return json.loads(response_text)
     except json.JSONDecodeError:
-        # 如果直接解析失败，尝试从文本中提取JSON
         try:
-            # 查找JSON对象的开始和结束位置
             start_idx = response_text.find('{')
             end_idx = response_text.rfind('}')
             if start_idx != -1 and end_idx != -1:
@@ -103,21 +99,17 @@ def extract_json_from_response(response_text: str) -> Dict:
     return None
 
 def process_single_item(item: Dict, language: str) -> Dict:
-    """处理单个数据项，使用 Cloudflare Workers AI"""
-    if not item or 'id' not in item or 'summary' not in item or 'abs' not in item or 'categories' not in item:
-        print(f"Invalid item: {item}", file=sys.stderr)
-        return None
-    
+    """处理单个数据项"""
     account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
     api_token = os.environ.get("CLOUDFLARE_API_TOKEN")
     model_name = os.environ.get("MODEL_NAME", "@cf/meta/llama-3-8b-instruct")
     
     if not account_id or not api_token:
-        print(f"Missing Cloudflare credentials for {item['id']}", file=sys.stderr)
+        print(f"Missing Cloudflare credentials", file=sys.stderr)
         return {
             **item,
             'AI': {
-                "tldr": item['summary'][:200] + "..." if item.get('summary') else "No summary available",
+                "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary",
                 "motivation": "N/A",
                 "method": "N/A",
                 "result": "N/A",
@@ -125,19 +117,24 @@ def process_single_item(item: Dict, language: str) -> Dict:
             }
         }
     
-    # 下载并提取 PDF 全文
-    full_text = download_pdf(item['abs'])
-    content = full_text if full_text else item['summary']
+    # 获取PDF URL - 优先使用pdf_url字段，如果没有则从abs字段构造
+    pdf_url = item.get('pdf_url')
+    if not pdf_url and 'abs' in item:
+        pdf_url = item['abs'].replace('/abs/', '/pdf/') + '.pdf'
+    
+    # 下载PDF
+    full_text = download_pdf(pdf_url) if pdf_url else None
+    content = full_text if full_text else item.get('summary', '')
     
     # 构建提示
     try:
         prompt = TEMPLATE.format(language=language, content=content[:12000])
-    except KeyError as e:
-        print(f"Template formatting error for {item['id']}: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Template error: {e}", file=sys.stderr)
         return {
             **item,
             'AI': {
-                "tldr": item['summary'][:200] + "..." if item.get('summary') else "No summary available",
+                "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary",
                 "motivation": "N/A",
                 "method": "N/A",
                 "result": "N/A",
@@ -154,12 +151,12 @@ def process_single_item(item: Dict, language: str) -> Dict:
                 if ai_data and all(key in ai_data for key in ["tldr", "motivation", "method", "result", "conclusion"]):
                     return {**item, 'AI': ai_data}
                 else:
-                    print(f"Invalid JSON response for {item['id']}: {response_text}", file=sys.stderr)
+                    print(f"Invalid JSON response for {item.get('id', 'unknown')}: {response_text[:100]}...", file=sys.stderr)
                     # 创建回退响应
                     return {
                         **item,
                         'AI': {
-                            "tldr": item['summary'][:200] + "..." if item.get('summary') else "No summary available",
+                            "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary available",
                             "motivation": "Extracted from paper content" if full_text else "Based on abstract",
                             "method": "See original paper for methodology details",
                             "result": "Refer to the paper for complete results",
@@ -167,9 +164,9 @@ def process_single_item(item: Dict, language: str) -> Dict:
                         }
                     }
             else:
-                print(f"Empty response for {item['id']} on attempt {attempt + 1}", file=sys.stderr)
+                print(f"Empty response for {item.get('id', 'unknown')} on attempt {attempt + 1}", file=sys.stderr)
         except Exception as e:
-            print(f"Attempt {attempt + 1} failed for {item['id']}: {e}", file=sys.stderr)
+            print(f"Attempt {attempt + 1} failed for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
         
         if attempt < 2:
             sleep(5)  # 增加重试间隔
@@ -178,7 +175,7 @@ def process_single_item(item: Dict, language: str) -> Dict:
     return {
         **item,
         'AI': {
-            "tldr": item['summary'][:200] + "..." if item.get('summary') else "No summary available",
+            "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary available",
             "motivation": "N/A",
             "method": "N/A",
             "result": "N/A",
@@ -228,6 +225,35 @@ def process_all_items(data: List[Dict], language: str, max_workers: int) -> List
     
     return processed_data
 
+def read_jsonl_file(file_path: str) -> List[Dict]:
+    """读取JSONL文件，无论扩展名是什么"""
+    data = []
+    print(f'Opening input file: {file_path}', file=sys.stderr)
+    
+    with open(file_path, "r", encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                # 检查必需字段 - 根据您的实际数据结构调整
+                if 'id' in item and 'title' in item and 'summary' in item:
+                    # 确保所有必需字段都有默认值
+                    item.setdefault('authors', [])
+                    item.setdefault('categories', [])
+                    item.setdefault('abs', '')
+                    item.setdefault('pdf_url', '')
+                    data.append(item)
+                else:
+                    print(f"Line {line_num}: Missing required fields - id: {'id' in item}, title: {'title' in item}, summary: {'summary' in item}", file=sys.stderr)
+                    print(f"Line content: {line[:100]}...", file=sys.stderr)
+            except json.JSONDecodeError as e:
+                print(f"Failed to parse JSON line {line_num}: {e}", file=sys.stderr)
+                print(f"Line content: {line[:100]}...", file=sys.stderr)
+    
+    return data
+
 def main():
     args = parse_args()
     language = os.environ.get("LANGUAGE", 'English')
@@ -247,30 +273,19 @@ def main():
         print(f"Removed existing output file: {target_file}", file=sys.stderr)
     
     # 读取数据
-    data = []
-    print(f'Opening input file: {args.data}', file=sys.stderr)
-    with open(args.data, "r", encoding='utf-8') as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-                # 确保所有必需字段都存在
-                required_fields = ['id', 'title', 'authors', 'summary', 'abs', 'categories']
-                if all(field in item for field in required_fields):
-                    data.append(item)
-                else:
-                    print(f"Skipping line {line_num}: Missing required fields", file=sys.stderr)
-            except json.JSONDecodeError as e:
-                print(f"Failed to parse JSON line {line_num}: {e}", file=sys.stderr)
+    data = read_jsonl_file(args.data)
+    
+    if not data:
+        print(f"No valid data found in {args.data}", file=sys.stderr)
+        sys.exit(1)
     
     # 去重
     seen_ids = set()
     unique_data = []
     for item in data:
-        if item['id'] not in seen_ids:
-            seen_ids.add(item['id'])
+        item_id = item.get('id')
+        if item_id and item_id not in seen_ids:
+            seen_ids.add(item_id)
             unique_data.append(item)
     
     data = unique_data
