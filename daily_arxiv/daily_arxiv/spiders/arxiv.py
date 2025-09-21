@@ -68,7 +68,7 @@ class ArxivAPISpider:
             # - sortBy: 排序字段（submittedDate表示按提交日期）
             # - sortOrder: 排序方向（desc表示降序）
             # - date_from/date_to: 日期范围（YYYYMMDD格式）
-            results = arxiv.query(
+            results = arxiv.Search(
                 id_list=[],
                 query=query,
                 start=0,
