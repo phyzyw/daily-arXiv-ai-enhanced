@@ -159,7 +159,8 @@ if __name__ == "__main__":
     results = spider.run(output_file=output_file)
 
     # 打印结果摘要
-    print('arxiv_version:', arxiv.__version__)
+    import pkg_resources
+    print('arxiv_version:', pkg_resources.get_distribution("arxiv").version)
     print(f"\n找到 {len(results)} 篇文章:")
     for result in results:
         print(f"- {result['id']}: {result['title']}")
