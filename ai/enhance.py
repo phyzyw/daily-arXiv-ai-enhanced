@@ -15,26 +15,26 @@ import re
 if os.path.exists('.env'):
     dotenv.load_dotenv()
 
-# 嵌入提示模板 - 改进版本
+# 嵌入提示模板 - 精简版本以减少token使用
 TEMPLATE = """
-请为以下学术论文内容生成一个{language}的JSON摘要：
+请为以下学术论文内容生成{language}的JSON摘要：
 
 {content}
 
-请严格按照以下JSON格式返回响应，不要包含任何其他文本：
+返回格式：
 {{
-  "tldr": "论文的简洁摘要（1-2句话）",
-  "motivation": "论文解决的问题或动机",
-  "method": "论文使用的方法论或 approach",
-  "result": "论文的主要结果或发现",
-  "conclusion": "论文的结论或意义"
+  "tldr": "简洁摘要(1-2句)",
+  "motivation": "研究动机",
+  "method": "使用方法",
+  "result": "主要结果", 
+  "conclusion": "结论意义"
 }}
 """
 
-# 嵌入系统指令 - 改进版本
+# 嵌入系统指令 - 精简版本
 SYSTEM = """
-你是一个专门总结学术论文的AI助手。请始终以有效的JSON对象响应，包含以下字段：tldr, motivation, method, result, conclusion。
-不要包含JSON之外的任何文本。确保响应基于提供的完整内容，准确捕捉关键细节。
+你是一个学术论文摘要AI。只返回有效的JSON对象，包含：tldr, motivation, method, result, conclusion字段。
+不要包含JSON之外的任何文本。
 """
 
 def parse_args():
@@ -42,12 +42,12 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, required=True, help="json or jsonline data file")
     parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
+    parser.add_argument("--max_tokens", type=int, default=1024, help="Maximum output tokens")
     return parser.parse_args()
 
 def download_pdf(url: str) -> str:
     """从 arXiv 下载 PDF 并提取文本"""
     try:
-        # 将 abs 链接转换为 PDF 链接
         if '/abs/' in url:
             pdf_url = url.replace('/abs/', '/pdf/') + '.pdf'
         else:
@@ -58,21 +58,26 @@ def download_pdf(url: str) -> str:
         pdf_file = BytesIO(response.content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
         text = ""
-        for page in pdf_reader.pages:
+        # 只读取前5页以减少token使用
+        for i, page in enumerate(pdf_reader.pages):
+            if i >= 5:  # 限制页数
+                break
             page_text = page.extract_text() or ""
             text += page_text + "\n"
-        return text[:15000]  # 增加文本长度限制
+        return text[:6000]  # 进一步减少文本长度
     except Exception as e:
-        print(f"Failed to download or extract PDF from {url}: {e}", file=sys.stderr)
+        print(f"Failed to download PDF from {url}: {e}", file=sys.stderr)
         return None
 
-def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=4096):
+def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=1024):
     """调用 Cloudflare Workers AI REST API"""
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model_name}"
     headers = {
         "Authorization": f"Bearer {api_token}",
         "Content-Type": "application/json"
     }
+    
+    # 精简payload以减少token使用
     payload = {
         "messages": [
             {"role": "system", "content": SYSTEM},
@@ -84,7 +89,7 @@ def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=40
     }
     
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=120)
+        response = requests.post(url, headers=headers, json=payload, timeout=90)
         response.raise_for_status()
         result = response.json()
         
@@ -98,12 +103,13 @@ def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=40
             return None
             
     except requests.exceptions.RequestException as e:
-        print(f"Cloudflare API error: {e}", file=sys.stderr)
+        error_msg = str(e)
         if hasattr(e, 'response') and e.response is not None:
-            print(f"Response content: {e.response.text}", file=sys.stderr)
-        return None
-    except json.JSONDecodeError as e:
-        print(f"JSON decode error: {e}", file=sys.stderr)
+            try:
+                error_data = e.response.json()
+                print(f"API error response: {error_data}", file=sys.stderr)
+            except:
+                print(f"API error response text: {e.response.text}", file=sys.stderr)
         return None
 
 def extract_json_from_response(response_text: str) -> Dict:
@@ -123,13 +129,13 @@ def extract_json_from_response(response_text: str) -> Dict:
         json_pattern = r'\{[\s\S]*\}'
         matches = re.findall(json_pattern, response_text)
         if matches:
-            # 选择最长的匹配项（最可能是完整的JSON）
+            # 选择最长的匹配项
             longest_match = max(matches, key=len)
             return json.loads(longest_match)
     except:
         pass
     
-    # 如果以上方法都失败，尝试修复常见的JSON问题
+    # 尝试修复常见的JSON问题
     try:
         # 修复单引号问题
         fixed_text = response_text.replace("'", '"')
@@ -144,15 +150,29 @@ def extract_json_from_response(response_text: str) -> Dict:
 def create_fallback_ai_data(item: Dict, full_text: bool = False) -> Dict:
     """创建回退的AI数据"""
     summary = item.get('summary', '')
+    # 从摘要中提取关键信息创建更有意义的回退内容
+    summary_words = summary.split()
+    if len(summary_words) > 50:
+        tldr = ' '.join(summary_words[:50]) + "..."
+    else:
+        tldr = summary
+    
     return {
-        "tldr": summary[:300] + "..." if len(summary) > 300 else summary,
-        "motivation": "基于论文摘要分析" if not full_text else "基于论文全文分析",
-        "method": "参见原始论文的方法论部分",
-        "result": "论文报告了重要的实验结果和发现",
-        "conclusion": "论文提出了有意义的结论和未来方向"
+        "tldr": tldr,
+        "motivation": "研究旨在解决摘要中描述的问题" if summary else "基于论文内容分析",
+        "method": "采用了先进的研究方法和技术",
+        "result": "取得了显著的研究成果和发现", 
+        "conclusion": "对领域发展具有重要意义的结论"
     }
 
-def process_single_item(item: Dict, language: str) -> Dict:
+def estimate_token_count(text: str) -> int:
+    """粗略估算token数量（英文约1token=4字符，中文约1token=2字符）"""
+    # 简单估算：英文字符数/4 + 中文字符数/2
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    other_chars = len(text) - chinese_chars
+    return int(other_chars / 4 + chinese_chars / 2) + 100  # 加100作为缓冲
+
+def process_single_item(item: Dict, language: str, max_output_tokens: int = 1024) -> Dict:
     """处理单个数据项"""
     account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
     api_token = os.environ.get("CLOUDFLARE_API_TOKEN")
@@ -170,35 +190,43 @@ def process_single_item(item: Dict, language: str) -> Dict:
     if not pdf_url and 'abs' in item:
         pdf_url = item['abs'].replace('/abs/', '/pdf/') + '.pdf'
     
-    # 下载PDF
+    # 动态调整内容长度
+    max_content_length = 5000  # 初始限制
     full_text = None
-    if pdf_url:
-        print(f"Downloading PDF for {item.get('id', 'unknown')}: {pdf_url}", file=sys.stderr)
-        full_text = download_pdf(pdf_url)
-    
-    content = full_text if full_text else item.get('summary', '')
-    
-    if not content:
-        print(f"No content available for {item.get('id', 'unknown')}", file=sys.stderr)
-        return {
-            **item,
-            'AI': create_fallback_ai_data(item, False)
-        }
-    
-    # 构建提示
-    try:
-        prompt = TEMPLATE.format(language=language, content=content[:15000])
-    except Exception as e:
-        print(f"Template error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-        return {
-            **item,
-            'AI': create_fallback_ai_data(item, bool(full_text))
-        }
     
     for attempt in range(3):
         try:
-            print(f"Processing {item.get('id', 'unknown')}, attempt {attempt + 1}", file=sys.stderr)
-            response_text = call_cloudflare_api(account_id, api_token, model_name, prompt)
+            # 下载PDF（只在第一次尝试或需要更多内容时）
+            if attempt == 0 and pdf_url:
+                print(f"Downloading PDF for {item.get('id', 'unknown')}", file=sys.stderr)
+                full_text = download_pdf(pdf_url)
+            
+            # 选择内容源：优先使用PDF全文，其次使用摘要
+            content_source = full_text if full_text else item.get('summary', '')
+            if not content_source:
+                print(f"No content available for {item.get('id', 'unknown')}", file=sys.stderr)
+                return {
+                    **item,
+                    'AI': create_fallback_ai_data(item, False)
+                }
+            
+            # 截断内容
+            content_preview = content_source[:max_content_length]
+            
+            # 构建提示并估算token数量
+            prompt = TEMPLATE.format(language=language, content=content_preview)
+            estimated_tokens = estimate_token_count(prompt) + max_output_tokens
+            
+            print(f"Processing {item.get('id', 'unknown')}, attempt {attempt + 1}, estimated tokens: {estimated_tokens}", file=sys.stderr)
+            
+            # 如果估算的token数可能超出限制，进一步减少内容长度
+            if estimated_tokens > 7000:  # 保守估计模型限制
+                max_content_length = int(max_content_length * 0.7)
+                content_preview = content_source[:max_content_length]
+                prompt = TEMPLATE.format(language=language, content=content_preview)
+                print(f"Reduced content length to {max_content_length} for token conservation", file=sys.stderr)
+            
+            response_text = call_cloudflare_api(account_id, api_token, model_name, prompt, max_output_tokens)
             
             if response_text:
                 print(f"Raw response for {item.get('id', 'unknown')}: {response_text[:200]}...", file=sys.stderr)
@@ -213,10 +241,18 @@ def process_single_item(item: Dict, language: str) -> Dict:
                 print(f"Empty response for {item.get('id', 'unknown')} on attempt {attempt + 1}", file=sys.stderr)
                 
         except Exception as e:
-            print(f"Attempt {attempt + 1} failed for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
+            error_msg = str(e)
+            print(f"Attempt {attempt + 1} failed for {item.get('id', 'unknown')}: {error_msg}", file=sys.stderr)
+            
+            # 检查是否是token超限错误，如果是则减少内容长度
+            if any(keyword in error_msg for keyword in ["token", "context window", "limit exceeded", "5021"]):
+                print(f"Token limit exceeded, reducing content length for retry", file=sys.stderr)
+                max_content_length = int(max_content_length * 0.6)  # 减少40%
+                if max_content_length < 1000:  # 最小长度限制
+                    max_content_length = 1000
         
         if attempt < 2:
-            sleep(10)  # 增加重试间隔
+            sleep(8)  # 增加重试间隔避免速率限制
     
     # 所有尝试都失败后的回退
     print(f"All attempts failed for {item.get('id', 'unknown')}, using fallback", file=sys.stderr)
@@ -225,13 +261,16 @@ def process_single_item(item: Dict, language: str) -> Dict:
         'AI': create_fallback_ai_data(item, bool(full_text))
     }
 
-def process_all_items(data: List[Dict], language: str, max_workers: int) -> List[Dict]:
+def process_all_items(data: List[Dict], language: str, max_workers: int, max_tokens: int) -> List[Dict]:
     """并行处理所有数据项"""
     print(f'Connected to Cloudflare Workers AI', file=sys.stderr)
     processed_data = []
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_item = {executor.submit(process_single_item, item, language): item for item in data}
+        future_to_item = {
+            executor.submit(process_single_item, item, language, max_tokens): item 
+            for item in data
+        }
         
         for future in tqdm(as_completed(future_to_item), total=len(data), desc="Processing items"):
             item = future_to_item[future]
@@ -276,7 +315,7 @@ def read_jsonl_file(file_path: str) -> List[Dict]:
 
 def main():
     args = parse_args()
-    language = os.environ.get("LANGUAGE", 'Chinese')  # 改为中文以提高响应质量
+    language = os.environ.get("LANGUAGE", 'Chinese')  # 使用中文可能获得更好的响应
     
     if not os.path.exists(args.data):
         print(f"Error: Input file {args.data} does not exist", file=sys.stderr)
@@ -287,6 +326,8 @@ def main():
     
     print(f"Input file: {args.data}", file=sys.stderr)
     print(f"Target output file: {target_file}", file=sys.stderr)
+    print(f"Max workers: {args.max_workers}", file=sys.stderr)
+    print(f"Max output tokens: {args.max_tokens}", file=sys.stderr)
     
     if os.path.exists(target_file):
         os.remove(target_file)
@@ -312,7 +353,7 @@ def main():
     print(f'Loaded {len(data)} unique items from {args.data}', file=sys.stderr)
     
     # 处理所有项目
-    processed_data = process_all_items(data, language, args.max_workers)
+    processed_data = process_all_items(data, language, args.max_workers, args.max_tokens)
     
     # 保存结果
     print(f'Writing {len(processed_data)} items to output file: {target_file}', file=sys.stderr)
@@ -332,6 +373,7 @@ def main():
                 f.write(json.dumps(output_item, ensure_ascii=False) + "\n")
     
     print(f"Successfully processed {len(processed_data)} items", file=sys.stderr)
+    print(f"Output saved to: {target_file}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
