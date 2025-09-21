@@ -1,19 +1,15 @@
 name: arXiv-daily-ai-enhanced
-
 on:
   schedule:
     - cron: '0 2 * * *' # 每天 UTC 2:00 运行
   workflow_dispatch: # 支持手动触发
-
 jobs:
   crawl-and-summarize:
     runs-on: ubuntu-latest
-
     steps:
       # 检出代码
       - name: Checkout repository
         uses: actions/checkout@v4
-
       # 设置 Miniconda 环境
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@v3
@@ -21,29 +17,27 @@ jobs:
           auto-update-conda: true
           python-version: '3.9' # 兼容 arxiv 库
           activate-environment: arxiv-env
-
       # 安装依赖
       - name: Install dependencies
         shell: bash -l {0}
         run: |
           conda install -c conda-forge python-dateutil requests
-          conda install conda-forge::arxiv 
+          conda install conda-forge::arxiv
           conda list
-
-      # 运行 arxiv.py 爬取论文
+      # 计算当天的日期
+      - name: Set today date
+        id: set-today
+        run: echo "TODAY=$(date -u +%Y-%m-%d)" >> $GITHUB_ENV
+      # 运行 arXiv API 爬虫
       - name: Run arXiv API spider
         shell: bash -l {0}
         env:
           CATEGORIES: ${{ vars.CATEGORIES }}
-          OUTPUT_FILE: data/${{ env.YESTERDAY }}.jsonl
-          YESTERDAY: ${{ steps.get-yesterday.outputs.yesterday }}
+          OUTPUT_FILE: data/${{ env.TODAY }}.json
         run: |
-          # 计算昨天的日期
-          YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
-          echo "YESTERDAY=$YESTERDAY" >> $GITHUB_ENV
+          echo "OUTPUT_FILE is $OUTPUT_FILE"
           python daily_arxiv/daily_arxiv/spiders/spider_arxiv.py
-
-      # 调用 DeepSeek API 生成摘要（假设存在 summarize.py）
+      # 调用 DeepSeek API 生成摘要
       - name: Generate summaries with DeepSeek
         shell: bash -l {0}
         env:
@@ -51,10 +45,9 @@ jobs:
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           MODEL_NAME: ${{ vars.MODEL_NAME }}
           LANGUAGE: ${{ vars.LANGUAGE }}
-          OUTPUT_FILE: data/${{ env.YESTERDAY }}.jsonl
+          OUTPUT_FILE: data/${{ env.TODAY }}.json
         run: |
-          python scripts/summarize.py # 假设有此脚本处理摘要
-
+          python scripts/summarize.py
       # 提交更新到 GitHub
       - name: Commit and push changes
         env:
@@ -64,9 +57,8 @@ jobs:
           git config --global user.email "${{ env.EMAIL }}"
           git config --global user.name "${{ env.NAME }}"
           git add data/
-          git commit -m "Update arXiv papers for ${{ env.YESTERDAY }}"
+          git commit -m "Update arXiv papers for ${{ env.TODAY }}"
           git push
-
       # 部署到 GitHub Pages
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
