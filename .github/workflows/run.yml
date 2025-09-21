@@ -27,7 +27,7 @@ jobs:
         shell: bash -l {0}
         run: |
           conda install -c conda-forge python-dateutil requests
-          pip install arxiv==0.5.3 # 兼容旧版 arxiv 库
+          conda install arxiv # 兼容旧版 arxiv 库
 
       # 运行 arxiv.py 爬取论文
       - name: Run arXiv API spider
@@ -40,7 +40,7 @@ jobs:
           # 计算昨天的日期
           YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
           echo "YESTERDAY=$YESTERDAY" >> $GITHUB_ENV
-          python spiders/arxiv.py
+          python daily_arxiv/daily_arxiv/spiders/arxiv.py
 
       # 调用 DeepSeek API 生成摘要（假设存在 summarize.py）
       - name: Generate summaries with DeepSeek
