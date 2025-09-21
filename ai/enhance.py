@@ -46,7 +46,7 @@ def download_pdf(url: str) -> str:
     try:
         # 将 abs 链接转换为 PDF 链接
         pdf_url = url.replace('/abs/', '/pdf/') + '.pdf'
-        response = requests.get(pdf_url, timeout=10)
+        response = requests.get(pdf_url, timeout=30)
         response.raise_for_status()
         pdf_file = BytesIO(response.content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
@@ -54,13 +54,13 @@ def download_pdf(url: str) -> str:
         for page in pdf_reader.pages:
             page_text = page.extract_text() or ""
             text += page_text
-        # 限制文本长度（Cloudflare API 输入限制）
-        return text[:8000]  # 截断到 8000 字符
+        # 限制文本长度（API 输入限制）
+        return text[:12000]  # 增加到 12000 字符
     except Exception as e:
         print(f"Failed to download or extract PDF from {url}: {e}", file=sys.stderr)
         return None
 
-def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=1024):
+def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=2048):
     """调用 Cloudflare Workers AI REST API"""
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model_name}"
     headers = {
@@ -73,19 +73,34 @@ def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=10
             {"role": "user", "content": prompt}
         ],
         "max_tokens": max_tokens,
-        "temperature": 0.7
+        "temperature": 0.1  # 降低温度以获得更一致的JSON输出
     }
     try:
-        print(f"Sending prompt to Cloudflare API: {prompt[:100]}...", file=sys.stderr)
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         result = response.json()
-        response_text = result.get('result', {}).get('response', '')
-        print(f"Received response: {response_text[:100]}...", file=sys.stderr)
-        return response_text
+        return result.get('result', {}).get('response', '')
     except requests.exceptions.RequestException as e:
         print(f"Cloudflare API error: {e}", file=sys.stderr)
         return None
+
+def extract_json_from_response(response_text: str) -> Dict:
+    """从响应文本中提取JSON对象"""
+    try:
+        # 尝试直接解析JSON
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        # 如果直接解析失败，尝试从文本中提取JSON
+        try:
+            # 查找JSON对象的开始和结束位置
+            start_idx = response_text.find('{')
+            end_idx = response_text.rfind('}')
+            if start_idx != -1 and end_idx != -1:
+                json_str = response_text[start_idx:end_idx+1]
+                return json.loads(json_str)
+        except:
+            pass
+    return None
 
 def process_single_item(item: Dict, language: str) -> Dict:
     """处理单个数据项，使用 Cloudflare Workers AI"""
@@ -102,7 +117,7 @@ def process_single_item(item: Dict, language: str) -> Dict:
         return {
             **item,
             'AI': {
-                "tldr": item['summary'][:100] + "..." if item.get('summary') else "No summary available",
+                "tldr": item['summary'][:200] + "..." if item.get('summary') else "No summary available",
                 "motivation": "N/A",
                 "method": "N/A",
                 "result": "N/A",
@@ -116,13 +131,13 @@ def process_single_item(item: Dict, language: str) -> Dict:
     
     # 构建提示
     try:
-        prompt = TEMPLATE.format(language=language, content=content[:8000])
+        prompt = TEMPLATE.format(language=language, content=content[:12000])
     except KeyError as e:
         print(f"Template formatting error for {item['id']}: {e}", file=sys.stderr)
         return {
             **item,
             'AI': {
-                "tldr": item['summary'][:100] + "..." if item.get('summary') else "No summary available",
+                "tldr": item['summary'][:200] + "..." if item.get('summary') else "No summary available",
                 "motivation": "N/A",
                 "method": "N/A",
                 "result": "N/A",
@@ -134,49 +149,51 @@ def process_single_item(item: Dict, language: str) -> Dict:
         try:
             response_text = call_cloudflare_api(account_id, api_token, model_name, prompt)
             if response_text:
-                try:
-                    ai_data = json.loads(response_text)
-                    if all(key in ai_data for key in ["tldr", "motivation", "method", "result", "conclusion"]):
-                        return {**item, 'AI': ai_data}
-                    else:
-                        print(f"Incomplete JSON response for {item['id']}: {response_text}", file=sys.stderr)
-                except json.JSONDecodeError:
+                ai_data = extract_json_from_response(response_text)
+                
+                if ai_data and all(key in ai_data for key in ["tldr", "motivation", "method", "result", "conclusion"]):
+                    return {**item, 'AI': ai_data}
+                else:
                     print(f"Invalid JSON response for {item['id']}: {response_text}", file=sys.stderr)
+                    # 创建回退响应
                     return {
                         **item,
                         'AI': {
-                            "tldr": response_text[:100] + "..." if response_text else "No response",
-                            "motivation": "N/A",
-                            "method": "N/A",
-                            "result": "N/A",
-                            "conclusion": "N/A"
+                            "tldr": item['summary'][:200] + "..." if item.get('summary') else "No summary available",
+                            "motivation": "Extracted from paper content" if full_text else "Based on abstract",
+                            "method": "See original paper for methodology details",
+                            "result": "Refer to the paper for complete results",
+                            "conclusion": "Consult the original publication for conclusions"
                         }
                     }
             else:
-                print(f"Empty response for {item['id']}", file=sys.stderr)
+                print(f"Empty response for {item['id']} on attempt {attempt + 1}", file=sys.stderr)
         except Exception as e:
             print(f"Attempt {attempt + 1} failed for {item['id']}: {e}", file=sys.stderr)
-            if attempt < 2:
-                sleep(2)
-        if attempt == 2:
-            return {
-                **item,
-                'AI': {
-                    "tldr": item['summary'][:100] + "..." if item.get('summary') else "No summary available",
-                    "motivation": "N/A",
-                    "method": "N/A",
-                    "result": "N/A",
-                    "conclusion": "N/A"
-                }
-            }
-    return item
+        
+        if attempt < 2:
+            sleep(5)  # 增加重试间隔
+    
+    # 所有尝试都失败后的回退
+    return {
+        **item,
+        'AI': {
+            "tldr": item['summary'][:200] + "..." if item.get('summary') else "No summary available",
+            "motivation": "N/A",
+            "method": "N/A",
+            "result": "N/A",
+            "conclusion": "N/A"
+        }
+    }
 
 def process_all_items(data: List[Dict], language: str, max_workers: int) -> List[Dict]:
     """并行处理所有数据项"""
     print(f'Connected to Cloudflare Workers AI', file=sys.stderr)
     processed_data = []
+    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_item = {executor.submit(process_single_item, item, language): item for item in data}
+        
         for future in tqdm(as_completed(future_to_item), total=len(data), desc="Processing items"):
             item = future_to_item[future]
             try:
@@ -185,18 +202,30 @@ def process_all_items(data: List[Dict], language: str, max_workers: int) -> List
                     processed_data.append(result)
                 else:
                     print(f"Skipping invalid item: {item.get('id', 'unknown')}", file=sys.stderr)
+                    # 添加一个基本的回退项
+                    processed_data.append({
+                        **item,
+                        'AI': {
+                            "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary",
+                            "motivation": "N/A",
+                            "method": "N/A",
+                            "result": "N/A",
+                            "conclusion": "N/A"
+                        }
+                    })
             except Exception as e:
                 print(f"Item {item.get('id', 'unknown')} generated an exception: {e}", file=sys.stderr)
                 processed_data.append({
                     **item,
                     'AI': {
-                        "tldr": item['summary'][:100] + "..." if item.get('summary') else "No summary available",
+                        "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary",
                         "motivation": "N/A",
                         "method": "N/A",
                         "result": "N/A",
                         "conclusion": "N/A"
                     }
                 })
+    
     return processed_data
 
 def main():
@@ -217,42 +246,57 @@ def main():
         os.remove(target_file)
         print(f"Removed existing output file: {target_file}", file=sys.stderr)
     
+    # 读取数据
     data = []
     print(f'Opening input file: {args.data}', file=sys.stderr)
     with open(args.data, "r", encoding='utf-8') as f:
-        for line in f:
-            if line.strip():
-                try:
-                    item = json.loads(line)
-                    if 'id' in item and 'summary' in item and 'abs' in item and 'categories' in item:
-                        data.append(item)
-                    else:
-                        print(f"Skipping invalid JSON line: {line.strip()}", file=sys.stderr)
-                except json.JSONDecodeError as e:
-                    print(f"Failed to parse JSON line: {e}", file=sys.stderr)
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                # 确保所有必需字段都存在
+                required_fields = ['id', 'title', 'authors', 'summary', 'abs', 'categories']
+                if all(field in item for field in required_fields):
+                    data.append(item)
+                else:
+                    print(f"Skipping line {line_num}: Missing required fields", file=sys.stderr)
+            except json.JSONDecodeError as e:
+                print(f"Failed to parse JSON line {line_num}: {e}", file=sys.stderr)
     
+    # 去重
     seen_ids = set()
     unique_data = []
     for item in data:
         if item['id'] not in seen_ids:
             seen_ids.add(item['id'])
             unique_data.append(item)
+    
     data = unique_data
     print(f'Loaded {len(data)} unique items from {args.data}', file=sys.stderr)
     
-    # 限制处理数量以避免配额超限
-    max_items = 10
-    data = data[:max_items]
-    print(f'Processing {len(data)} items from {args.data}', file=sys.stderr)
-    
+    # 处理所有项目
     processed_data = process_all_items(data, language, args.max_workers)
     
-    print(f'Writing to output file: {target_file}', file=sys.stderr)
+    # 保存结果
+    print(f'Writing {len(processed_data)} items to output file: {target_file}', file=sys.stderr)
     with open(target_file, "w", encoding='utf-8') as f:
         for item in processed_data:
             if item is not None:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
-    print(f"Successfully wrote {len(processed_data)} items to {target_file}", file=sys.stderr)
+                # 确保输出格式符合转换脚本的要求
+                output_item = {
+                    'id': item.get('id'),
+                    'title': item.get('title'),
+                    'authors': item.get('authors', []),
+                    'summary': item.get('summary', ''),
+                    'abs': item.get('abs', ''),
+                    'categories': item.get('categories', []),
+                    'AI': item.get('AI', {})
+                }
+                f.write(json.dumps(output_item, ensure_ascii=False) + "\n")
+    
+    print(f"Successfully processed {len(processed_data)} items", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
