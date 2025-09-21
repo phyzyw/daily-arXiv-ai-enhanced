@@ -25,11 +25,15 @@
             errorDiv.style.maxWidth = '80%';
             errorDiv.textContent = `错误: ${message} (${source}:${lineno}:${colno})`;
             document.body.appendChild(errorDiv);
-            
+           
             setTimeout(() => errorDiv.remove(), 5000);
-            
+           
             return false;
         };
+    </script>
+    <!-- 注入 CATEGORIES 的占位符 -->
+    <script>
+        window.CATEGORIES = ""cs.CV,cs.CL"";
     </script>
 </head>
 <body>
@@ -58,14 +62,14 @@
                         </div>
                     </a>
                 </div>
-                
+               
                 <div class="header-center">
                     <a href="index.html" class="site-logo">
                         <img src="assets/logo2-removebg-preview.png" alt="Daily arXiv AI Enhanced Logo" class="logo-image">
                         <span class="site-title">Daily arXiv AI Enhanced</span>
                     </a>
                 </div>
-                
+               
                 <div class="header-controls">
                     <div class="date-selector">
                         <div class="date-display">
@@ -123,7 +127,6 @@
                 </div>
             </div>
         </header>
-
         <main>
             <div class="date-picker-modal" id="datePickerModal">
                 <div class="date-picker-content">
@@ -142,7 +145,6 @@
                     </div>
                 </div>
             </div>
-
             <div class="paper-container" id="paperContainer">
                 <div class="loading-container">
                     <div class="loading-spinner"></div>
@@ -150,7 +152,6 @@
                 </div>
             </div>
         </main>
-
         <div class="paper-modal" id="paperModal">
             <div class="paper-modal-content">
                 <div class="paper-modal-header">
@@ -194,13 +195,12 @@
             </div>
         </div>
     </div>
-    
+   
     <footer>
         <div class="footer-content">
             <p>&copy; 2025 daily-arXiv-ai-enhanced | <a href="https://github.com/dw-dengwei/daily-arXiv-ai-enhanced" target="_blank">GitHub</a></p>
         </div>
     </footer>
-
     <script src="js/app.js?v=1.0.1"></script>
 </body>
-</html> 
+</html>
