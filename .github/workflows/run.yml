@@ -18,19 +18,31 @@ jobs:
           auto-update-conda: true
           python-version: '3.9' # 兼容 arxiv 库
           activate-environment: arxiv-env
+          environment-file: environment.yml
+          auto-activate-base: false
 
       # 安装依赖
       - name: Install dependencies
         shell: bash -l {0}
         run: |
           conda install -c conda-forge python-dateutil requests arxiv
-          pip install langchain-huggingface tqdm python-dotenv
+          pip install langchain langchain-core langchain-huggingface tqdm python-dotenv
           conda list
+          pip list
 
       # 计算当天的日期
       - name: Set today date
         id: set-today
         run: echo "TODAY=$(date -u +%Y-%m-%d)" >> $GITHUB_ENV
+
+      # 清理无效文件
+      - name: Clean up invalid files
+        shell: bash -l {0}
+        run: |
+          if [ -f "data/null" ]; then
+            rm data/null
+            echo "Removed invalid file: data/null"
+          fi
 
       # 运行 arXiv API 爬虫
       - name: Run arXiv API spider
