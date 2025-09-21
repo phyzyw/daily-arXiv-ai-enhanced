@@ -2,9 +2,11 @@ import os
 import logging
 import json
 import re
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import arxiv  # 使用新版arxiv库
+import arxiv
+from arxiv import SortCriterion, SortOrder
 
 class ArxivAPISpider:
     def __init__(self, categories=None, date=None):
@@ -41,70 +43,82 @@ class ArxivAPISpider:
         self.logger.info(f"目标类别对: {self.target_category_pairs}, 目标日期: {self.target_date}")
 
     def construct_query(self):
-        """构造新版arXiv API的查询字符串"""
-        queries = []
+        """构造新版arXiv API的查询字符串，并直接包含日期范围"""
+        # 转换日期格式
+        target_date_obj = datetime.strptime(self.target_date, "%Y-%m-%d")
+        start_date_str = target_date_obj.strftime("%Y%m%d")
+        end_date_str = (target_date_obj + timedelta(days=1)).strftime("%Y%m%d")
+        
+        base_queries = []
         for target_cat, cross_cat in self.target_category_pairs:
-            # 新版API使用的类别查询格式
-            queries.append(f"cat:{target_cat} AND cat:{cross_cat}")
-        return " OR ".join(queries)
+            # 为每个类别对构造查询
+            category_query = f"cat:{target_cat} AND cat:{cross_cat}"
+            # 将日期范围添加到查询中
+            full_query = f"({category_query}) AND submittedDate:[{start_date_str} TO {end_date_str}]"
+            base_queries.append(full_query)
+        
+        # 用 OR 连接不同类别对的查询
+        return " OR ".join(base_queries)
 
-    def search_articles(self, max_results=1000):
+    def search_articles(self, max_results=200):
         """使用新版arXiv API搜索文章"""
         query = self.construct_query()
         self.logger.info(f"执行查询: {query}")
 
         try:
-            # 转换日期格式
-            target_date_obj = datetime.strptime(self.target_date, "%Y-%m-%d")
-            start_date = target_date_obj
-            end_date = target_date_obj + timedelta(days=1)
-
-            # 新版API使用不同的查询构造方式
+            # 使用推荐的 Client 方式
+            client = arxiv.Client()
             search = arxiv.Search(
                 query=query,
                 max_results=max_results,
-                sort_by=arxiv.SortCriterion.SubmittedDate,
-                sort_order=arxiv.SortOrder.Descending
+                sort_by=SortCriterion.SubmittedDate,
+                sort_order=SortOrder.Descending
             )
             
-            # 手动过滤日期，因为新版API可能不支持直接日期范围查询
+            # 获取结果
             results = []
-            for result in search.results():
-                published_date = result.published.date()
-                if start_date.date() <= published_date < end_date.date():
-                    # 转换为旧格式以保持兼容性
-                    result_dict = {
-                        'id': result.entry_id,
-                        'title': result.title,
-                        'authors': [{'name': author.name} for author in result.authors],
-                        'summary': result.summary,
-                        'published': result.published.isoformat(),
-                        'categories': [str(cat) for cat in result.categories],
-                        'pdf_url': result.pdf_url,
-                        'primary_category': str(result.primary_category) if result.primary_category else ""
-                    }
-                    results.append(result_dict)
-                    
+            for result in client.results(search):
+                # 转换为与后续代码兼容的字典格式
+                result_dict = {
+                    'id': result.entry_id,
+                    'title': result.title,
+                    'authors': [{'name': author.name} for author in result.authors],
+                    'summary': result.summary,
+                    'published': result.published.isoformat(),
+                    'categories': [str(cat) for cat in result.categories],
+                    'pdf_url': result.pdf_url,
+                    'primary_category': str(result.primary_category) if result.primary_category else ""
+                }
+                results.append(result_dict)
+                
             return results
 
         except Exception as e:
             self.logger.error(f"搜索文章时出错: {str(e)}")
             return []
 
-    def filter_by_date(self, results):
-        """按日期和类别筛选结果（适配新版数据格式）"""
+    def search_articles_with_retry(self, max_results=200, retries=3):
+        """带重试的搜索函数"""
+        for attempt in range(retries):
+            try:
+                return self.search_articles(max_results)
+            except Exception as e:
+                self.logger.warning(f"搜索尝试 {attempt+1}/{retries} 失败: {str(e)}")
+                if attempt < retries - 1:
+                    wait_time = 2 ** attempt  # 指数退避
+                    self.logger.info(f"{wait_time}秒后重试...")
+                    time.sleep(wait_time)
+                else:
+                    self.logger.error("所有重试均失败。")
+                    return []
+        return []
+
+    def filter_by_categories(self, results):
+        """确保文章确实同时包含目标类别对（二次验证）"""
         filtered_results = []
-        target_date_str = self.target_date
-        
         for result in results:
-            # 验证提交日期
-            published_str = result.get('published', '')[:10]  # 取YYYY-MM-DD部分
-            if published_str != target_date_str:
-                continue
-                
-            # 提取类别
             categories = result.get('categories', [])
-                
+            
             # 验证是否匹配目标类别对
             for target_cat, cross_cat in self.target_category_pairs:
                 if target_cat in categories and cross_cat in categories:
@@ -116,7 +130,7 @@ class ArxivAPISpider:
                         "title": result.get('title', '').replace('\n', ''),
                         "authors": [author.get('name', '') for author in result.get('authors', [])],
                         "summary": result.get('summary', '').replace('\n', ' '),
-                        "published": target_date_str,
+                        "published": self.target_date,
                         "categories": categories,
                         "pdf_url": result.get('pdf_url', ''),
                         "primary_category": categories[0] if categories else ""
@@ -129,8 +143,9 @@ class ArxivAPISpider:
         self.logger.info("开始使用 arXiv API搜索文章...")
 
         try:
-            results = self.search_articles(max_results=1000)
-            filtered_results = self.filter_by_date(results)
+            # 使用带重试的搜索
+            results = self.search_articles_with_retry(max_results=200, retries=3)
+            filtered_results = self.filter_by_categories(results)
             self.logger.info(f"找到 {len(filtered_results)} 篇匹配的文章")
 
             for result in filtered_results:
@@ -165,10 +180,14 @@ if __name__ == "__main__":
     results = spider.run(output_file=output_file)
 
     # 打印结果摘要
-    import pkg_resources
-    print('arxiv_version:', pkg_resources.get_distribution("arxiv").version)
+    try:
+        import pkg_resources
+        print('arxiv_version:', pkg_resources.get_distribution("arxiv").version)
+    except:
+        print("无法获取arxiv库版本信息")
+    
     print(f"\n找到 {len(results)} 篇文章:")
     for result in results:
         print(f"- {result['id']}: {result['title']}")
-        print(f" 类别: {result['categories']}")
-        print(f" 日期: {result['published']}\n")
+        print(f"  类别: {result['categories']}")
+        print(f"  日期: {result['published']}\n")
