@@ -18,7 +18,6 @@ jobs:
           auto-update-conda: true
           python-version: '3.9' # 兼容 arxiv 库
           activate-environment: arxiv-env
-          environment-file: environment.yml
           auto-activate-base: false
 
       # 安装依赖
