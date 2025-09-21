@@ -47,7 +47,7 @@ class ArxivAPISpider:
        
         return " OR ".join(base_queries)
 
-    def search_articles_simple(self, max_results=200):
+    def search_articles_simple(self, max_results=1000):
         """简单搜索，不进行复杂的分页控制"""
         query = self.construct_query()
         self.logger.info(f"执行查询: {query}")
