@@ -12,6 +12,7 @@ from langchain.prompts import (
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
 )
+from langchain_core.messages import AIMessage
 
 if os.path.exists('.env'):
     dotenv.load_dotenv()
@@ -33,11 +34,23 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
             "language": language,
             "content": item['summary']
         })
-        # HuggingFace may not directly support structured output, so parse if necessary
+        # Handle different response types
         if isinstance(response, dict):
             item['AI'] = response
+        elif isinstance(response, AIMessage):
+            # Extract content from AIMessage
+            try:
+                item['AI'] = json.loads(response.content)
+            except json.JSONDecodeError:
+                item['AI'] = {
+                    "tldr": response.content,  # Fallback to raw content
+                    "motivation": "Error",
+                    "method": "Error",
+                    "result": "Error",
+                    "conclusion": "Error"
+                }
         else:
-            # Assume response is a string containing JSON (common for HF models)
+            # Assume response is a string containing JSON
             try:
                 item['AI'] = json.loads(response)
             except json.JSONDecodeError:
