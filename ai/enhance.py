@@ -14,7 +14,6 @@ from langchain.prompts import (
     SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
 )
-from structure import Structure
 
 if os.path.exists('.env'):
     dotenv.load_dotenv()
@@ -70,13 +69,11 @@ def process_all_items(data: List[Dict], model_name: str, language: str, max_work
         huggingfacehub_api_token=os.environ.get("HUGGINGFACE_API_KEY"),
     )
     print(f'Connect to: {model_name}', file=sys.stderr)
-
     prompt_template = ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(system),
         HumanMessagePromptTemplate.from_template(template=template)
     ])
     chain = prompt_template | llm
-
     # 使用线程池并行处理
     processed_data = [None] * len(data)  # 预分配结果列表
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -96,21 +93,39 @@ def process_all_items(data: List[Dict], model_name: str, language: str, max_work
             except Exception as e:
                 print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
                 processed_data[idx] = data[idx]
-
     return processed_data
 
 def main():
     args = parse_args()
     model_name = os.environ.get("MODEL_NAME", 'meta-llama/Llama-3.1-8B-Instruct')
     language = os.environ.get("LANGUAGE", 'Chinese')
-    target_file = args.data.replace('.jsonl', f'_AI_enhanced_{language}.jsonl')
+    
+    # 确保输入文件存在
+    if not os.path.exists(args.data):
+        print(f"Error: Input file {args.data} does not exist", file=sys.stderr)
+        sys.exit(1)
+    
+    # 计算输出文件名，确保基于输入文件名生成正确的输出路径
+    base_name = os.path.splitext(args.data)[0]  # 去掉扩展名
+    target_file = f"{base_name}_AI_enhanced_{language}.jsonl"
+    
+    print(f"Input file: {args.data}", file=sys.stderr)
+    print(f"Target output file: {target_file}", file=sys.stderr)
+    
+    # 如果输出文件存在，删除它
     if os.path.exists(target_file):
         os.remove(target_file)
-        print(f'Removed existing file: {target_file}', file=sys.stderr)
+        print(f"Removed existing output file: {target_file}", file=sys.stderr)
+    
+    # 读取输入文件
     data = []
-    with open(args.data, "r") as f:
+    print(f'Opening input file: {args.data}', file=sys.stderr)
+    with open(args.data, "r", encoding='utf-8') as f:
         for line in f:
-            data.append(json.loads(line))
+            if line.strip():
+                data.append(json.loads(line))
+    
+    # 去重
     seen_ids = set()
     unique_data = []
     for item in data:
@@ -118,18 +133,22 @@ def main():
             seen_ids.add(item['id'])
             unique_data.append(item)
     data = unique_data
-    print(f'Open: {args.data}', file=sys.stderr)
-
+    print(f'Loaded {len(data)} unique items from {args.data}', file=sys.stderr)
+    
+    # 处理数据
     processed_data = process_all_items(
         data,
         model_name,
         language,
         args.max_workers
     )
-
-    with open(target_file, "w") as f:
+    
+    # 写入输出文件
+    print(f'Writing to output file: {target_file}', file=sys.stderr)
+    with open(target_file, "w", encoding='utf-8') as f:
         for item in processed_data:
-            f.write(json.dumps(item) + "\n")
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    print(f"Successfully wrote {len(processed_data)} items to {target_file}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
