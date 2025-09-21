@@ -43,8 +43,7 @@ class ArxivAPISpider:
         self.logger.info(f"目标类别对: {self.target_category_pairs}")
 
     def construct_query(self):
-        """构造正确的查询字符串 - 修复逻辑错误"""
-        # 正确的查询逻辑: (cs.CV AND (cs.LG OR cs.AI))
+        """构造正确的查询字符串"""
         base_queries = []
         for target_cat in self.categories:
             # 对于每个主类别，构造 (cs.LG OR cs.AI) 的子查询
@@ -53,85 +52,92 @@ class ArxivAPISpider:
         
         return " OR ".join(base_queries)
 
-    def search_articles_with_pagination(self, max_results=300):
-        """带分页控制的搜索，避免API限制"""
+    def search_articles_simple(self, max_results=200):
+        """简单搜索，不进行复杂的分页控制"""
         query = self.construct_query()
         self.logger.info(f"执行查询: {query}")
 
-        all_results = []
-        max_retries = 3
-        batch_size = 100  # 每次获取100条
-        
         try:
             client = arxiv.Client()
+            search = arxiv.Search(
+                query=query,
+                max_results=max_results,
+                sort_by=SortCriterion.SubmittedDate,
+                sort_order=SortOrder.Descending
+            )
             
-            # 分批获取结果，避免分页错误
-            for start in range(0, max_results, batch_size):
-                remaining = max_results - start
-                current_batch_size = min(batch_size, remaining)
+            results = []
+            for result in client.results(search):
+                result_dict = {
+                    'id': result.entry_id,
+                    'title': result.title,
+                    'authors': [{'name': author.name} for author in result.authors],
+                    'summary': result.summary,
+                    'published': result.published.isoformat(),
+                    'categories': [str(cat) for cat in result.categories],
+                    'pdf_url': result.pdf_url,
+                    'primary_category': str(result.primary_category) if result.primary_category else ""
+                }
+                results.append(result_dict)
                 
-                if current_batch_size <= 0:
-                    break
-                
-                self.logger.info(f"获取第 {start} 到 {start + current_batch_size - 1} 条结果")
-                
+            self.logger.info(f"查询返回 {len(results)} 条原始结果")
+            return results
+
+        except Exception as e:
+            self.logger.error(f"搜索文章时出错: {str(e)}")
+            return []
+
+    def search_multiple_queries(self, max_results_per_query=100):
+        """为每个类别对分别执行查询，避免复杂查询语法问题"""
+        all_results = []
+        
+        for target_cat, cross_cat in self.target_category_pairs:
+            query = f"cat:{target_cat} AND cat:{cross_cat}"
+            self.logger.info(f"执行子查询: {query}")
+            
+            try:
+                client = arxiv.Client()
                 search = arxiv.Search(
                     query=query,
-                    max_results=current_batch_size,
-                    start=start,
+                    max_results=max_results_per_query,
                     sort_by=SortCriterion.SubmittedDate,
                     sort_order=SortOrder.Descending
                 )
                 
-                # 带重试机制的获取
-                for attempt in range(max_retries):
-                    try:
-                        batch_results = list(client.results(search))
-                        if not batch_results:
-                            self.logger.info(f"第 {start} 批没有更多结果，停止搜索")
-                            return all_results
-                        
-                        for result in batch_results:
-                            result_dict = {
-                                'id': result.entry_id,
-                                'title': result.title,
-                                'authors': [{'name': author.name} for author in result.authors],
-                                'summary': result.summary,
-                                'published': result.published.isoformat(),
-                                'categories': [str(cat) for cat in result.categories],
-                                'pdf_url': result.pdf_url,
-                                'primary_category': str(result.primary_category) if result.primary_category else ""
-                            }
-                            all_results.append(result_dict)
-                        
-                        self.logger.info(f"成功获取第 {start} 批的 {len(batch_results)} 条结果")
-                        break
-                        
-                    except Exception as e:
-                        if attempt < max_retries - 1:
-                            wait_time = 2 ** attempt
-                            self.logger.warning(f"第 {start} 批获取失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
-                            self.logger.info(f"{wait_time}秒后重试...")
-                            time.sleep(wait_time)
-                        else:
-                            self.logger.error(f"第 {start} 批所有重试均失败: {str(e)}")
-                            return all_results
+                batch_results = []
+                for result in client.results(search):
+                    result_dict = {
+                        'id': result.entry_id,
+                        'title': result.title,
+                        'authors': [{'name': author.name} for author in result.authors],
+                        'summary': result.summary,
+                        'published': result.published.isoformat(),
+                        'categories': [str(cat) for cat in result.categories],
+                        'pdf_url': result.pdf_url,
+                        'primary_category': str(result.primary_category) if result.primary_category else ""
+                    }
+                    batch_results.append(result_dict)
                 
-                # 检查是否已经获取到足够旧的结果
-                if len(all_results) > 0:
-                    oldest_result_date = datetime.fromisoformat(all_results[-1]['published'].replace('Z', '+00:00'))
-                    if oldest_result_date < self.start_date:
-                        self.logger.info(f"已获取到足够旧的结果 ({oldest_result_date.strftime('%Y-%m-%d')})，停止搜索")
-                        break
+                self.logger.info(f"子查询 '{query}' 返回 {len(batch_results)} 条结果")
+                all_results.extend(batch_results)
                 
                 # 避免请求过于频繁
                 time.sleep(1)
                 
-            return all_results
-
-        except Exception as e:
-            self.logger.error(f"搜索文章时出错: {str(e)}")
-            return all_results
+            except Exception as e:
+                self.logger.error(f"子查询 '{query}' 出错: {str(e)}")
+                continue
+        
+        # 去重
+        unique_results = []
+        seen_ids = set()
+        for result in all_results:
+            paper_id = re.sub(r'v\d+$', '', result.get('id', '').split('/')[-1])
+            if paper_id not in seen_ids:
+                seen_ids.add(paper_id)
+                unique_results.append(result)
+        
+        return unique_results
 
     def filter_articles_by_date_range(self, results):
         """按日期范围筛选结果"""
@@ -182,12 +188,16 @@ class ArxivAPISpider:
             grouped[date].append(result)
         return grouped
 
-    def run(self, output_file=None):
+    def run(self, output_file=None, strategy="multiple"):
         """运行爬虫"""
         self.logger.info(f"开始搜索最近 {self.days} 天的文章...")
 
         try:
-            results = self.search_articles_with_pagination(max_results=500)
+            if strategy == "multiple":
+                results = self.search_multiple_queries(max_results_per_query=150)
+            else:
+                results = self.search_articles_simple(max_results=300)
+            
             self.logger.info(f"总共获取到 {len(results)} 条原始结果")
             
             filtered_results = self.filter_articles_by_date_range(results)
@@ -222,7 +232,7 @@ if __name__ == "__main__":
     # 从环境变量获取类别，或使用默认值
     categories = os.environ.get("CATEGORIES", "cs.CV,cs.CL")
     
-    # 从环境变量获取天数，默认为3天
+    # 从环境变量获取天数，默认为5天
     days = int(os.environ.get("DAYS", "5"))
     
     # 生成输出文件名，包含日期范围
@@ -237,7 +247,8 @@ if __name__ == "__main__":
         days=days
     )
     
-    results = spider.run(output_file=output_file)
+    # 使用多查询策略，更稳定
+    results = spider.run(output_file=output_file, strategy="multiple")
 
     # 打印结果摘要
     print(f"\n找到 {len(results)} 篇文章 (最近 {days} 天):")
@@ -255,10 +266,3 @@ if __name__ == "__main__":
         for result in articles:
             print(f"  - {result['id']}: {result['title'][:60]}...")
             print(f"    类别: {result['categories']}")
-    
-    if not results:
-        print("未找到符合条件的文章。")
-        print("建议:")
-        print("1. 检查网络连接")
-        print("2. 等待几分钟后重试（arXiv API可能有速率限制）")
-        print("3. 手动验证查询: https://arxiv.org/search/?query=cat%3Acs.CL+AND+(cat%3Acs.LG+OR+cat%3Acs.AI)&searchtype=all&abstracts=show&order=-submitted_date&size=50")
