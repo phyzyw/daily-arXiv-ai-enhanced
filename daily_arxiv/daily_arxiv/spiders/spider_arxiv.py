@@ -4,11 +4,11 @@ import json
 import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import arxiv  # 兼容0.x版本的arxiv库
+import arxiv  # 使用新版arxiv库
 
 class ArxivAPISpider:
     def __init__(self, categories=None, date=None):
-        """初始化 arXiv 爬虫（兼容旧版本库）"""
+        """初始化 arXiv 爬虫（适配新版arxiv库）"""
         # 设置日志
         logging.basicConfig(
             level=logging.INFO,
@@ -41,44 +41,50 @@ class ArxivAPISpider:
         self.logger.info(f"目标类别对: {self.target_category_pairs}, 目标日期: {self.target_date}")
 
     def construct_query(self):
-        """构造符合旧版arXiv API的查询字符串"""
+        """构造新版arXiv API的查询字符串"""
         queries = []
         for target_cat, cross_cat in self.target_category_pairs:
-            # 旧版API使用的类别查询格式
-            queries.append(f"cat:{target_cat}+AND+cat:{cross_cat}")
-        return "+OR+".join(queries)
+            # 新版API使用的类别查询格式
+            queries.append(f"cat:{target_cat} AND cat:{cross_cat}")
+        return " OR ".join(queries)
 
     def search_articles(self, max_results=1000):
-        """使用旧版arXiv API搜索文章"""
+        """使用新版arXiv API搜索文章"""
         query = self.construct_query()
         self.logger.info(f"执行查询: {query}")
 
         try:
-            # 转换日期格式（旧版API使用YYYYMMDD格式）
+            # 转换日期格式
             target_date_obj = datetime.strptime(self.target_date, "%Y-%m-%d")
-            start_date = target_date_obj.strftime("%Y%m%d")
-            end_date = (target_date_obj + timedelta(days=1)).strftime("%Y%m%d")
+            start_date = target_date_obj
+            end_date = target_date_obj + timedelta(days=1)
 
-            # 旧版API使用arxiv.query()方法
-            # 参数说明：
-            # - id_list: 为空表示不按ID筛选
-            # - query: 搜索关键词/类别
-            # - start: 起始索引
-            # - max_results: 最大结果数
-            # - sortBy: 排序字段（submittedDate表示按提交日期）
-            # - sortOrder: 排序方向（desc表示降序）
-            # - date_from/date_to: 日期范围（YYYYMMDD格式）
-            results = arxiv.Search(
-                id_list=[],
+            # 新版API使用不同的查询构造方式
+            search = arxiv.Search(
                 query=query,
-                start=0,
                 max_results=max_results,
-                sortBy="submittedDate",
-                sortOrder="descending",
-                date_from=start_date,
-                date_to=end_date
+                sort_by=arxiv.SortCriterion.SubmittedDate,
+                sort_order=arxiv.SortOrder.Descending
             )
-
+            
+            # 手动过滤日期，因为新版API可能不支持直接日期范围查询
+            results = []
+            for result in search.results():
+                published_date = result.published.date()
+                if start_date.date() <= published_date < end_date.date():
+                    # 转换为旧格式以保持兼容性
+                    result_dict = {
+                        'id': result.entry_id,
+                        'title': result.title,
+                        'authors': [{'name': author.name} for author in result.authors],
+                        'summary': result.summary,
+                        'published': result.published.isoformat(),
+                        'categories': [str(cat) for cat in result.categories],
+                        'pdf_url': result.pdf_url,
+                        'primary_category': str(result.primary_category) if result.primary_category else ""
+                    }
+                    results.append(result_dict)
+                    
             return results
 
         except Exception as e:
@@ -86,12 +92,12 @@ class ArxivAPISpider:
             return []
 
     def filter_by_date(self, results):
-        """按日期和类别筛选结果"""
+        """按日期和类别筛选结果（适配新版数据格式）"""
         filtered_results = []
         target_date_str = self.target_date
         
         for result in results:
-            # 验证提交日期（旧版API返回的是UTC时间字符串）
+            # 验证提交日期
             published_str = result.get('published', '')[:10]  # 取YYYY-MM-DD部分
             if published_str != target_date_str:
                 continue
@@ -166,4 +172,3 @@ if __name__ == "__main__":
         print(f"- {result['id']}: {result['title']}")
         print(f" 类别: {result['categories']}")
         print(f" 日期: {result['published']}\n")
-    
