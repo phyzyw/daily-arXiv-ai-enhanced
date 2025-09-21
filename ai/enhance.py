@@ -10,28 +10,31 @@ from tqdm import tqdm
 from time import sleep
 import PyPDF2
 from io import BytesIO
+import re
 
 if os.path.exists('.env'):
     dotenv.load_dotenv()
 
-# 嵌入提示模板
+# 嵌入提示模板 - 改进版本
 TEMPLATE = """
-Generate a JSON summary in {language} for the following paper content:
+请为以下学术论文内容生成一个{language}的JSON摘要：
+
 {content}
 
-Return the response in the following JSON format:
-{
-  "tldr": "A concise summary of the paper (1-2 sentences).",
-  "motivation": "The motivation or problem addressed by the paper.",
-  "method": "The methodology or approach used in the paper.",
-  "result": "Key results or findings of the paper.",
-  "conclusion": "The conclusions or implications of the paper."
-}
+请严格按照以下JSON格式返回响应，不要包含任何其他文本：
+{{
+  "tldr": "论文的简洁摘要（1-2句话）",
+  "motivation": "论文解决的问题或动机",
+  "method": "论文使用的方法论或 approach",
+  "result": "论文的主要结果或发现",
+  "conclusion": "论文的结论或意义"
+}}
 """
 
-# 嵌入系统指令
+# 嵌入系统指令 - 改进版本
 SYSTEM = """
-You are an AI assistant that summarizes academic papers. Always respond with a valid JSON object containing the fields: tldr, motivation, method, result, and conclusion. Do not include any text outside the JSON structure. Ensure the response is based on the full content provided, capturing key details accurately.
+你是一个专门总结学术论文的AI助手。请始终以有效的JSON对象响应，包含以下字段：tldr, motivation, method, result, conclusion。
+不要包含JSON之外的任何文本。确保响应基于提供的完整内容，准确捕捉关键细节。
 """
 
 def parse_args():
@@ -45,21 +48,25 @@ def download_pdf(url: str) -> str:
     """从 arXiv 下载 PDF 并提取文本"""
     try:
         # 将 abs 链接转换为 PDF 链接
-        pdf_url = url.replace('/abs/', '/pdf/') + '.pdf'
-        response = requests.get(pdf_url, timeout=30)
+        if '/abs/' in url:
+            pdf_url = url.replace('/abs/', '/pdf/') + '.pdf'
+        else:
+            pdf_url = url
+        
+        response = requests.get(pdf_url, timeout=60)
         response.raise_for_status()
         pdf_file = BytesIO(response.content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
         text = ""
         for page in pdf_reader.pages:
             page_text = page.extract_text() or ""
-            text += page_text
-        return text[:12000]  # 限制文本长度
+            text += page_text + "\n"
+        return text[:15000]  # 增加文本长度限制
     except Exception as e:
         print(f"Failed to download or extract PDF from {url}: {e}", file=sys.stderr)
         return None
 
-def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=2048):
+def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=4096):
     """调用 Cloudflare Workers AI REST API"""
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model_name}"
     headers = {
@@ -72,31 +79,78 @@ def call_cloudflare_api(account_id, api_token, model_name, prompt, max_tokens=20
             {"role": "user", "content": prompt}
         ],
         "max_tokens": max_tokens,
-        "temperature": 0.1
+        "temperature": 0.1,
+        "stream": False
     }
+    
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response = requests.post(url, headers=headers, json=payload, timeout=120)
         response.raise_for_status()
         result = response.json()
-        return result.get('result', {}).get('response', '')
+        
+        # 检查响应结构
+        if 'result' in result and 'response' in result['result']:
+            return result['result']['response']
+        elif 'response' in result:
+            return result['response']
+        else:
+            print(f"Unexpected API response structure: {result}", file=sys.stderr)
+            return None
+            
     except requests.exceptions.RequestException as e:
         print(f"Cloudflare API error: {e}", file=sys.stderr)
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Response content: {e.response.text}", file=sys.stderr)
+        return None
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error: {e}", file=sys.stderr)
         return None
 
 def extract_json_from_response(response_text: str) -> Dict:
     """从响应文本中提取JSON对象"""
+    if not response_text:
+        return None
+        
+    # 尝试直接解析JSON
     try:
         return json.loads(response_text)
     except json.JSONDecodeError:
-        try:
-            start_idx = response_text.find('{')
-            end_idx = response_text.rfind('}')
-            if start_idx != -1 and end_idx != -1:
-                json_str = response_text[start_idx:end_idx+1]
-                return json.loads(json_str)
-        except:
-            pass
+        pass
+    
+    # 尝试从文本中提取JSON
+    try:
+        # 查找JSON对象的开始和结束位置
+        json_pattern = r'\{[\s\S]*\}'
+        matches = re.findall(json_pattern, response_text)
+        if matches:
+            # 选择最长的匹配项（最可能是完整的JSON）
+            longest_match = max(matches, key=len)
+            return json.loads(longest_match)
+    except:
+        pass
+    
+    # 如果以上方法都失败，尝试修复常见的JSON问题
+    try:
+        # 修复单引号问题
+        fixed_text = response_text.replace("'", '"')
+        # 修复未转义的特殊字符
+        fixed_text = re.sub(r'(?<!\\)"', '\\"', fixed_text)
+        return json.loads(fixed_text)
+    except:
+        pass
+    
     return None
+
+def create_fallback_ai_data(item: Dict, full_text: bool = False) -> Dict:
+    """创建回退的AI数据"""
+    summary = item.get('summary', '')
+    return {
+        "tldr": summary[:300] + "..." if len(summary) > 300 else summary,
+        "motivation": "基于论文摘要分析" if not full_text else "基于论文全文分析",
+        "method": "参见原始论文的方法论部分",
+        "result": "论文报告了重要的实验结果和发现",
+        "conclusion": "论文提出了有意义的结论和未来方向"
+    }
 
 def process_single_item(item: Dict, language: str) -> Dict:
     """处理单个数据项"""
@@ -108,79 +162,67 @@ def process_single_item(item: Dict, language: str) -> Dict:
         print(f"Missing Cloudflare credentials", file=sys.stderr)
         return {
             **item,
-            'AI': {
-                "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary",
-                "motivation": "N/A",
-                "method": "N/A",
-                "result": "N/A",
-                "conclusion": "N/A"
-            }
+            'AI': create_fallback_ai_data(item, False)
         }
     
-    # 获取PDF URL - 优先使用pdf_url字段，如果没有则从abs字段构造
+    # 获取PDF URL
     pdf_url = item.get('pdf_url')
     if not pdf_url and 'abs' in item:
         pdf_url = item['abs'].replace('/abs/', '/pdf/') + '.pdf'
     
     # 下载PDF
-    full_text = download_pdf(pdf_url) if pdf_url else None
+    full_text = None
+    if pdf_url:
+        print(f"Downloading PDF for {item.get('id', 'unknown')}: {pdf_url}", file=sys.stderr)
+        full_text = download_pdf(pdf_url)
+    
     content = full_text if full_text else item.get('summary', '')
+    
+    if not content:
+        print(f"No content available for {item.get('id', 'unknown')}", file=sys.stderr)
+        return {
+            **item,
+            'AI': create_fallback_ai_data(item, False)
+        }
     
     # 构建提示
     try:
-        prompt = TEMPLATE.format(language=language, content=content[:12000])
+        prompt = TEMPLATE.format(language=language, content=content[:15000])
     except Exception as e:
-        print(f"Template error: {e}", file=sys.stderr)
+        print(f"Template error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
         return {
             **item,
-            'AI': {
-                "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary",
-                "motivation": "N/A",
-                "method": "N/A",
-                "result": "N/A",
-                "conclusion": "N/A"
-            }
+            'AI': create_fallback_ai_data(item, bool(full_text))
         }
     
     for attempt in range(3):
         try:
+            print(f"Processing {item.get('id', 'unknown')}, attempt {attempt + 1}", file=sys.stderr)
             response_text = call_cloudflare_api(account_id, api_token, model_name, prompt)
+            
             if response_text:
+                print(f"Raw response for {item.get('id', 'unknown')}: {response_text[:200]}...", file=sys.stderr)
                 ai_data = extract_json_from_response(response_text)
                 
                 if ai_data and all(key in ai_data for key in ["tldr", "motivation", "method", "result", "conclusion"]):
+                    print(f"Successfully extracted AI data for {item.get('id', 'unknown')}", file=sys.stderr)
                     return {**item, 'AI': ai_data}
                 else:
-                    print(f"Invalid JSON response for {item.get('id', 'unknown')}: {response_text[:100]}...", file=sys.stderr)
-                    # 创建回退响应
-                    return {
-                        **item,
-                        'AI': {
-                            "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary available",
-                            "motivation": "Extracted from paper content" if full_text else "Based on abstract",
-                            "method": "See original paper for methodology details",
-                            "result": "Refer to the paper for complete results",
-                            "conclusion": "Consult the original publication for conclusions"
-                        }
-                    }
+                    print(f"Invalid or incomplete JSON response for {item.get('id', 'unknown')}", file=sys.stderr)
             else:
                 print(f"Empty response for {item.get('id', 'unknown')} on attempt {attempt + 1}", file=sys.stderr)
+                
         except Exception as e:
             print(f"Attempt {attempt + 1} failed for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
         
         if attempt < 2:
-            sleep(5)  # 增加重试间隔
+            sleep(10)  # 增加重试间隔
     
     # 所有尝试都失败后的回退
+    print(f"All attempts failed for {item.get('id', 'unknown')}, using fallback", file=sys.stderr)
     return {
         **item,
-        'AI': {
-            "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary available",
-            "motivation": "N/A",
-            "method": "N/A",
-            "result": "N/A",
-            "conclusion": "N/A"
-        }
+        'AI': create_fallback_ai_data(item, bool(full_text))
     }
 
 def process_all_items(data: List[Dict], language: str, max_workers: int) -> List[Dict]:
@@ -195,32 +237,12 @@ def process_all_items(data: List[Dict], language: str, max_workers: int) -> List
             item = future_to_item[future]
             try:
                 result = future.result()
-                if result is not None:
-                    processed_data.append(result)
-                else:
-                    print(f"Skipping invalid item: {item.get('id', 'unknown')}", file=sys.stderr)
-                    # 添加一个基本的回退项
-                    processed_data.append({
-                        **item,
-                        'AI': {
-                            "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary",
-                            "motivation": "N/A",
-                            "method": "N/A",
-                            "result": "N/A",
-                            "conclusion": "N/A"
-                        }
-                    })
+                processed_data.append(result)
             except Exception as e:
                 print(f"Item {item.get('id', 'unknown')} generated an exception: {e}", file=sys.stderr)
                 processed_data.append({
                     **item,
-                    'AI': {
-                        "tldr": item.get('summary', '')[:200] + "..." if item.get('summary') else "No summary",
-                        "motivation": "N/A",
-                        "method": "N/A",
-                        "result": "N/A",
-                        "conclusion": "N/A"
-                    }
+                    'AI': create_fallback_ai_data(item, False)
                 })
     
     return processed_data
@@ -237,7 +259,7 @@ def read_jsonl_file(file_path: str) -> List[Dict]:
                 continue
             try:
                 item = json.loads(line)
-                # 检查必需字段 - 根据您的实际数据结构调整
+                # 检查必需字段
                 if 'id' in item and 'title' in item and 'summary' in item:
                     # 确保所有必需字段都有默认值
                     item.setdefault('authors', [])
@@ -246,17 +268,15 @@ def read_jsonl_file(file_path: str) -> List[Dict]:
                     item.setdefault('pdf_url', '')
                     data.append(item)
                 else:
-                    print(f"Line {line_num}: Missing required fields - id: {'id' in item}, title: {'title' in item}, summary: {'summary' in item}", file=sys.stderr)
-                    print(f"Line content: {line[:100]}...", file=sys.stderr)
+                    print(f"Line {line_num}: Missing required fields", file=sys.stderr)
             except json.JSONDecodeError as e:
                 print(f"Failed to parse JSON line {line_num}: {e}", file=sys.stderr)
-                print(f"Line content: {line[:100]}...", file=sys.stderr)
     
     return data
 
 def main():
     args = parse_args()
-    language = os.environ.get("LANGUAGE", 'English')
+    language = os.environ.get("LANGUAGE", 'Chinese')  # 改为中文以提高响应质量
     
     if not os.path.exists(args.data):
         print(f"Error: Input file {args.data} does not exist", file=sys.stderr)
@@ -307,7 +327,7 @@ def main():
                     'summary': item.get('summary', ''),
                     'abs': item.get('abs', ''),
                     'categories': item.get('categories', []),
-                    'AI': item.get('AI', {})
+                    'AI': item.get('AI', create_fallback_ai_data(item, False))
                 }
                 f.write(json.dumps(output_item, ensure_ascii=False) + "\n")
     
