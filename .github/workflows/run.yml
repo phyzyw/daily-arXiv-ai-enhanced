@@ -10,6 +10,7 @@ jobs:
       # 检出代码
       - name: Checkout repository
         uses: actions/checkout@v4
+
       # 设置 Miniconda 环境
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@v3
@@ -17,17 +18,20 @@ jobs:
           auto-update-conda: true
           python-version: '3.9' # 兼容 arxiv 库
           activate-environment: arxiv-env
+
       # 安装依赖
       - name: Install dependencies
         shell: bash -l {0}
         run: |
-          conda install -c conda-forge python-dateutil requests
-          conda install conda-forge::arxiv
+          conda install -c conda-forge python-dateutil requests arxiv
+          pip install langchain-huggingface tqdm python-dotenv
           conda list
+
       # 计算当天的日期
       - name: Set today date
         id: set-today
         run: echo "TODAY=$(date -u +%Y-%m-%d)" >> $GITHUB_ENV
+
       # 运行 arXiv API 爬虫
       - name: Run arXiv API spider
         shell: bash -l {0}
@@ -37,33 +41,179 @@ jobs:
         run: |
           echo "OUTPUT_FILE is $OUTPUT_FILE"
           python daily_arxiv/daily_arxiv/spiders/spider_arxiv.py
-      # 调用 DeepSeek API 生成摘要
-      - name: Generate summaries with DeepSeek
+
+      # 检查生成的文件
+      - name: Check output file
+        shell: bash -l {0}
+        run: |
+          ls -l data/
+          if [ -f "data/${{ env.TODAY }}.json" ]; then
+            echo "Output file data/${{ env.TODAY }}.json exists"
+          else
+            echo "Error: Output file data/${{ env.TODAY }}.json not found"
+            exit 1
+          fi
+
+      # 去重检查
+      - name: Check for duplicates
+        id: dedup_check
+        shell: bash -l {0}
+        run: |
+          echo "执行去重检查... / Performing intelligent deduplication check..."
+          cd daily_arxiv
+          # 执行去重检查脚本
+          set +e # 暂时允许命令失败
+          python daily_arxiv/check_stats.py
+          dedup_exit_code=$?
+          set -e # 恢复严格模式
+          echo "去重检查退出码: $dedup_exit_code / Dedup check exit code: $dedup_exit_code"
+          echo "dedup_exit_code=$dedup_exit_code" >> $GITHUB_OUTPUT
+          case $dedup_exit_code in
+            0)
+              echo "has_new_content=true" >> $GITHUB_OUTPUT
+              ;;
+            1)
+              echo "has_new_content=false" >> $GITHUB_OUTPUT
+              echo "skip_reason=no_new_content" >> $GITHUB_OUTPUT
+              ;;
+            2)
+              echo "has_new_content=false" >> $GITHUB_OUTPUT
+              echo "skip_reason=processing_error" >> $GITHUB_OUTPUT
+              exit 1
+              ;;
+            *)
+              echo "❌ 未知退出码，停止工作流 / Unknown exit code, stop workflow"
+              echo "has_new_content=false" >> $GITHUB_OUTPUT
+              echo "skip_reason=unknown_error" >> $GITHUB_OUTPUT
+              exit 1
+              ;;
+          esac
+
+      # AI 增强处理
+      - name: AI Enhancement Processing
+        if: steps.dedup_check.outputs.has_new_content == 'true'
         shell: bash -l {0}
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          MODEL_NAME: ${{ vars.MODEL_NAME }}
+          HUGGINGFACE_API_KEY: ${{ secrets.HUGGINGFACE_API_KEY }}
           LANGUAGE: ${{ vars.LANGUAGE }}
-          OUTPUT_FILE: data/${{ env.TODAY }}.json
+          MODEL_NAME: ${{ vars.MODEL_NAME }}
         run: |
-          python scripts/summarize.py
-      # 提交更新到 GitHub
-      - name: Commit and push changes
+          echo "开始AI增强处理... / Starting AI enhancement processing..."
+          cd ai
+          export HUGGINGFACE_API_KEY
+          export LANGUAGE
+          export MODEL_NAME
+          python enhance.py --data ../data/${{ env.TODAY }}.json
+          # 检查AI增强文件是否生成
+          if [ -f "../data/${{ env.TODAY }}_AI_enhanced_${{ vars.LANGUAGE }}.jsonl" ]; then
+            echo "AI enhanced file ../data/${{ env.TODAY }}_AI_enhanced_${{ vars.LANGUAGE }}.jsonl exists"
+          else
+            echo "Error: AI enhanced file ../data/${{ env.TODAY }}_AI_enhanced_${{ vars.LANGUAGE }}.jsonl not found"
+            exit 1
+          fi
+          echo "AI增强处理完成 / AI enhancement processing completed"
+
+      # 转换为 Markdown
+      - name: Convert to Markdown
+        if: steps.dedup_check.outputs.has_new_content == 'true'
+        shell: bash -l {0}
+        env:
+          LANGUAGE: ${{ vars.LANGUAGE }}
+        run: |
+          echo "转换为Markdown格式... / Converting to Markdown format..."
+          cd to_md
+          AI_FILE="../data/${{ env.TODAY }}_AI_enhanced_${{ vars.LANGUAGE }}.jsonl"
+          if [ -f "$AI_FILE" ]; then
+            echo "使用AI增强文件进行转换... / Using AI enhanced file for conversion..."
+            python convert.py --data "$AI_FILE"
+          else
+            echo "错误：未找到AI增强文件 / Error: AI enhanced file not found"
+            echo "AI文件: $AI_FILE"
+            exit 1
+          fi
+          if [ $? -ne 0 ]; then
+            echo "Markdown转换失败 / Markdown conversion failed"
+            exit 1
+          fi
+          echo "Markdown转换完成 / Markdown conversion completed"
+
+      # 更新文件列表
+      - name: Update file list
+        if: steps.dedup_check.outputs.has_new_content == 'true'
+        shell: bash -l {0}
+        run: |
+          echo "更新文件列表... / Updating file list..."
+          ls data/*.json data/*.jsonl 2>/dev/null | sed 's|data/||' > assets/file-list.txt || true
+          echo "文件列表更新完成 / File list updated"
+
+      # 提交变更
+      - name: Commit changes
+        if: steps.dedup_check.outputs.has_new_content == 'true'
+        shell: bash -l {0}
         env:
           EMAIL: ${{ vars.EMAIL }}
           NAME: ${{ vars.NAME }}
         run: |
           git config --global user.email "${{ env.EMAIL }}"
           git config --global user.name "${{ env.NAME }}"
-          git add data/
-          git commit -m "Update arXiv papers for ${{ env.TODAY }}"
-          git push
+          git add .
+          if git diff --staged --quiet; then
+            echo "没有变更需要提交 / No changes to commit"
+            exit 0
+          fi
+          git commit -m "update: ${{ env.TODAY }} arXiv papers"
+          echo "变更已提交 / Changes committed"
+
+      # 推送变更
+      - name: Pull latest changes and push
+        if: steps.dedup_check.outputs.has_new_content == 'true'
+        shell: bash -l {0}
+        run: |
+          git config pull.rebase true
+          git config rebase.autoStash true
+          for i in {1..3}; do
+            echo "推送尝试 $i / Push attempt $i"
+            if git push origin main; then
+              echo "推送成功 / Push successful"
+              break
+            else
+              echo "推送失败，拉取最新变更... / Push failed, pulling latest changes..."
+              git pull origin main --no-edit || true
+              if [ $i -eq 3 ]; then
+                echo "3次尝试后推送失败 / Failed to push after 3 attempts"
+                exit 1
+              fi
+            fi
+          done
+
       # 部署到 GitHub Pages
       - name: Deploy to GitHub Pages
+        if: success()
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./
           keep_files: true
-        if: success()
+
+      # 总结
+      - name: Summary
+        shell: bash -l {0}
+        run: |
+          if [ "${{ steps.dedup_check.outputs.has_new_content }}" = "true" ]; then
+            echo "✅ 工作流完成：去重发现新内容并成功处理 / Workflow completed: Smart deduplication found new content and processed successfully"
+          else
+            case "${{ steps.dedup_check.outputs.skip_reason }}" in
+              "no_new_content")
+                echo "ℹ️ 工作流完成：去重后无新内容 / Workflow completed: No new content after smart deduplication"
+                ;;
+              "processing_error")
+                echo "⚠️ 工作流完成：去重处理出错 / Workflow completed: Deduplication processing error"
+                ;;
+              "unknown_error")
+                echo "⚠️ 工作流完成：未知错误 / Workflow completed: Unknown error"
+                ;;
+              *)
+                echo "ℹ️ 工作流完成：未知原因跳过处理 / Workflow completed: Skipped for unknown reason"
+                ;;
+            esac
+          fi
