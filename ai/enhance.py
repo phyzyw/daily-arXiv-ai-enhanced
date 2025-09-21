@@ -3,12 +3,10 @@ import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict
-from queue import Queue
-from threading import Lock
 import dotenv
 import argparse
 from tqdm import tqdm
-from langchain_huggingface import ChatHuggingFace
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from langchain.prompts import (
     ChatPromptTemplate,
     SystemMessagePromptTemplate,
@@ -64,11 +62,20 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
 def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
     """并行处理所有数据项"""
     # Initialize Hugging Face model
-    llm = ChatHuggingFace(
-        model_id=model_name,
-        huggingfacehub_api_token=os.environ.get("HUGGINGFACE_API_KEY"),
-    )
-    print(f'Connect to: {model_name}', file=sys.stderr)
+    try:
+        llm_endpoint = HuggingFaceEndpoint(
+            repo_id=model_name,
+            huggingfacehub_api_token=os.environ.get("HUGGINGFACE_API_KEY"),
+            task="text-generation",
+            max_new_tokens=512,
+            temperature=0.7,
+        )
+        llm = ChatHuggingFace(llm=llm_endpoint)
+        print(f'Connected to Hugging Face model: {model_name}', file=sys.stderr)
+    except Exception as e:
+        print(f"Failed to initialize HuggingFace model {model_name}: {e}", file=sys.stderr)
+        sys.exit(1)
+
     prompt_template = ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(system),
         HumanMessagePromptTemplate.from_template(template=template)
