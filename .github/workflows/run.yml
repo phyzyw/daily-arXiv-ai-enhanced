@@ -41,7 +41,7 @@ jobs:
           # 计算昨天的日期
           YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
           echo "YESTERDAY=$YESTERDAY" >> $GITHUB_ENV
-          python daily_arxiv/daily_arxiv/spiders/arxiv.py
+          python daily_arxiv/daily_arxiv/spiders/spider_arxiv.py
 
       # 调用 DeepSeek API 生成摘要（假设存在 summarize.py）
       - name: Generate summaries with DeepSeek
