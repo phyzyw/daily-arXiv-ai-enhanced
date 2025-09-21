@@ -229,7 +229,7 @@ if __name__ == "__main__":
     categories = os.environ.get("CATEGORIES", "cs.CV,cs.CL")
    
     # 从环境变量获取天数，默认为5天
-    days = int(os.environ.get("DAYS", "5"))
+    days = int(os.environ.get("DAYS", "3"))
    
     # 生成输出文件名，使用当天日期
     today = datetime.now(ZoneInfo("UTC")).strftime('%Y-%m-%d')
