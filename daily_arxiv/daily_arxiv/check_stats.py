@@ -1,154 +1,153 @@
-import os
+#!/usr/bin/env python3
+"""
+检查Scrapy爬取统计信息的脚本 / Script to check Scrapy crawling statistics
+用于获取去重检查的状态结果 / Used to get deduplication check status results
+功能说明 / Features:
+- 检查当日与昨日论文数据的重复情况 / Check duplication between today's and yesterday's paper data
+- 删除重复论文条目，保留新内容 / Remove duplicate papers, keep new content
+- 根据去重后的结果决定工作流是否继续 / Decide workflow continuation based on deduplication results
+"""
 import json
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict
-from queue import Queue
-from threading import Lock
-import dotenv
-import argparse
-from tqdm import tqdm
-from langchain_huggingface import ChatHuggingFace
-from langchain.prompts import (
-    ChatPromptTemplate,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-)
+import os
+from datetime import datetime, timedelta
 
-if os.path.exists('.env'):
-    dotenv.load_dotenv()
-
-template = open("template.txt", "r").read()
-system = open("system.txt", "r").read()
-
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, required=True, help="jsonline data file")
-    parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
-    return parser.parse_args()
-
-def process_single_item(chain, item: Dict, language: str) -> Dict:
-    """处理单个数据项"""
+def load_papers_data(file_path):
+    """
+    从json文件加载完整的论文数据
+    Load complete paper data from json file
+   
+    Args:
+        file_path (str): JSON文件路径 / JSON file path
+       
+    Returns:
+        list: 论文数据列表 / List of paper data
+        set: 论文ID集合 / Set of paper IDs
+    """
+    if not os.path.exists(file_path):
+        return [], set()
+   
+    papers = []
+    ids = set()
     try:
-        response = chain.invoke({
-            "language": language,
-            "content": item['summary']
-        })
-        # HuggingFace may not directly support structured output, so parse if necessary
-        if isinstance(response, dict):
-            item['AI'] = response
-        else:
-            # Assume response is a string containing JSON (common for HF models)
-            try:
-                item['AI'] = json.loads(response)
-            except json.JSONDecodeError:
-                item['AI'] = {
-                    "tldr": response,  # Fallback to raw response
-                    "motivation": "Error",
-                    "method": "Error",
-                    "result": "Error",
-                    "conclusion": "Error"
-                }
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    data = json.loads(line)
+                    papers.append(data)
+                    ids.add(data.get('id', ''))
+        return papers, ids
     except Exception as e:
-        print(f"Failed to process {item['id']}: {e}", file=sys.stderr)
-        item['AI'] = {
-            "tldr": "Error",
-            "motivation": "Error",
-            "method": "Error",
-            "result": "Error",
-            "conclusion": "Error"
-        }
-    return item
+        print(f"Error reading {file_path}: {e}", file=sys.stderr)
+        return [], set()
 
-def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
-    """并行处理所有数据项"""
-    # Initialize Hugging Face model
-    llm = ChatHuggingFace(
-        model_id=model_name,
-        huggingfacehub_api_token=os.environ.get("HUGGINGFACE_API_KEY"),
-    )
-    print(f'Connect to: {model_name}', file=sys.stderr)
-    prompt_template = ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(system),
-        HumanMessagePromptTemplate.from_template(template=template)
-    ])
-    chain = prompt_template | llm
-    # 使用线程池并行处理
-    processed_data = [None] * len(data)  # 预分配结果列表
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_idx = {
-            executor.submit(process_single_item, chain, item, language): idx
-            for idx, item in enumerate(data)
-        }
-        for future in tqdm(
-            as_completed(future_to_idx),
-            total=len(data),
-            desc="Processing items"
-        ):
-            idx = future_to_idx[future]
-            try:
-                result = future.result()
-                processed_data[idx] = result
-            except Exception as e:
-                print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
-                processed_data[idx] = data[idx]
-    return processed_data
+def save_papers_data(papers, file_path):
+    """
+    保存论文数据到json文件
+    Save paper data to json file
+   
+    Args:
+        papers (list): 论文数据列表 / List of paper data
+        file_path (str): 文件路径 / File path
+    """
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            for paper in papers:
+                f.write(json.dumps(paper, ensure_ascii=False) + '\n')
+        return True
+    except Exception as e:
+        print(f"Error saving {file_path}: {e}", file=sys.stderr)
+        return False
+
+def perform_deduplication():
+    """
+    执行多日去重：删除与历史多日重复的论文条目，保留新内容
+    Perform deduplication over multiple past days
+   
+    Returns:
+        str: 去重状态 / Deduplication status
+             - "has_new_content": 有新内容 / Has new content
+             - "no_new_content": 无新内容 / No new content
+             - "no_data": 无数据 / No data
+             - "error": 处理错误 / Processing error
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_file = f"../data/{today}.json"  # 修改为 .json
+    history_days = 7  # 向前追溯几天的数据进行对比
+    if not os.path.exists(today_file):
+        print("今日数据文件不存在 / Today's data file does not exist", file=sys.stderr)
+        return "no_data"
+    try:
+        today_papers, today_ids = load_papers_data(today_file)
+        print(f"今日论文总数: {len(today_papers)} / Today's total papers: {len(today_papers)}", file=sys.stderr)
+        if not today_papers:
+            return "no_data"
+        # 收集历史多日 ID 集合
+        history_ids = set()
+        for i in range(1, history_days + 1):
+            date_str = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            history_file = f"../data/{date_str}.json"  # 修改为 .json
+            _, past_ids = load_papers_data(history_file)
+            history_ids.update(past_ids)
+        print(f"历史{history_days}日去重库大小: {len(history_ids)} / History {history_days} days deduplication library size: {len(history_ids)}", file=sys.stderr)
+        duplicate_ids = today_ids & history_ids
+        if duplicate_ids:
+            print(f"发现 {len(duplicate_ids)} 篇历史重复论文 / Found {len(duplicate_ids)} historical duplicate papers", file=sys.stderr)
+            new_papers = [paper for paper in today_papers if paper.get('id', '') not in duplicate_ids]
+            print(f"去重后剩余论文数: {len(new_papers)} / Remaining papers after deduplication: {len(new_papers)}", file=sys.stderr)
+            if new_papers:
+                if save_papers_data(new_papers, today_file):
+                    print(f"已更新今日文件，移除 {len(duplicate_ids)} 篇重复论文 / Today's file updated, removed {len(duplicate_ids)} duplicate papers", file=sys.stderr)
+                    return "has_new_content"
+                else:
+                    print("保存去重后的数据失败 / Failed to save deduplicated data", file=sys.stderr)
+                    return "error"
+            else:
+                try:
+                    os.remove(today_file)
+                    print("所有论文均为重复内容，已删除今日文件 / All papers are duplicate content, today's file deleted", file=sys.stderr)
+                except Exception as e:
+                    print(f"删除文件失败: {e} / Failed to delete file: {e}", file=sys.stderr)
+                return "no_new_content"
+        else:
+            print("所有内容均为新内容 / All content is new", file=sys.stderr)
+            return "has_new_content"
+    except Exception as e:
+        print(f"去重处理失败: {e} / Deduplication processing failed: {e}", file=sys.stderr)
+        return "error"
 
 def main():
-    args = parse_args()
-    model_name = os.environ.get("MODEL_NAME", 'meta-llama/Llama-3.1-8B-Instruct')
-    language = os.environ.get("LANGUAGE", 'Chinese')
-    
-    # 确保输入文件存在
-    if not os.path.exists(args.data):
-        print(f"Error: Input file {args.data} does not exist", file=sys.stderr)
+    """
+    检查去重状态并返回相应的退出码
+    Check deduplication status and return corresponding exit code
+   
+    退出码含义 / Exit code meanings:
+    0: 有新内容，继续处理 / Has new content, continue processing
+    1: 无新内容，停止工作流 / No new content, stop workflow
+    2: 处理错误 / Processing error
+    """
+   
+    print("正在执行去重检查... / Performing intelligent deduplication check...", file=sys.stderr)
+   
+    # 执行去重处理 / Perform deduplication processing
+    dedup_status = perform_deduplication()
+   
+    if dedup_status == "has_new_content":
+        print("✅ 去重完成，发现新内容，继续工作流 / Deduplication completed, new content found, continue workflow", file=sys.stderr)
+        sys.exit(0)
+    elif dedup_status == "no_new_content":
+        print("⏹️ 去重完成，无新内容，停止工作流 / Deduplication completed, no new content, stop workflow", file=sys.stderr)
         sys.exit(1)
-    
-    # 计算输出文件名，确保基于输入文件名生成正确的输出路径
-    base_name = os.path.splitext(args.data)[0]  # 去掉扩展名
-    target_file = f"{base_name}_AI_enhanced_{language}.jsonl"
-    
-    print(f"Input file: {args.data}", file=sys.stderr)
-    print(f"Target output file: {target_file}", file=sys.stderr)
-    
-    # 如果输出文件存在，删除它
-    if os.path.exists(target_file):
-        os.remove(target_file)
-        print(f"Removed existing output file: {target_file}", file=sys.stderr)
-    
-    # 读取输入文件
-    data = []
-    print(f'Opening input file: {args.data}', file=sys.stderr)
-    with open(args.data, "r", encoding='utf-8') as f:
-        for line in f:
-            if line.strip():
-                data.append(json.loads(line))
-    
-    # 去重
-    seen_ids = set()
-    unique_data = []
-    for item in data:
-        if item['id'] not in seen_ids:
-            seen_ids.add(item['id'])
-            unique_data.append(item)
-    data = unique_data
-    print(f'Loaded {len(data)} unique items from {args.data}', file=sys.stderr)
-    
-    # 处理数据
-    processed_data = process_all_items(
-        data,
-        model_name,
-        language,
-        args.max_workers
-    )
-    
-    # 写入输出文件
-    print(f'Writing to output file: {target_file}', file=sys.stderr)
-    with open(target_file, "w", encoding='utf-8') as f:
-        for item in processed_data:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-    print(f"Successfully wrote {len(processed_data)} items to {target_file}", file=sys.stderr)
+    elif dedup_status == "no_data":
+        print("⏹️ 今日无数据，停止工作流 / No data today, stop workflow", file=sys.stderr)
+        sys.exit(1)
+    elif dedup_status == "error":
+        print("❌ 去重处理出错，停止工作流 / Deduplication processing error, stop workflow", file=sys.stderr)
+        sys.exit(2)
+    else:
+        # 意外情况：未知状态 / Unexpected case: unknown status
+        print("❌ 未知去重状态，停止工作流 / Unknown deduplication status, stop workflow", file=sys.stderr)
+        sys.exit(2)
 
 if __name__ == "__main__":
     main()
