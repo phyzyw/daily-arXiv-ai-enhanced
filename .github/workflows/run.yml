@@ -28,6 +28,7 @@ jobs:
         run: |
           conda install -c conda-forge python-dateutil requests
           conda install conda-forge::arxiv 
+          conda list
 
       # 运行 arxiv.py 爬取论文
       - name: Run arXiv API spider
